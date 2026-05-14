@@ -176,6 +176,125 @@ Transactions in Ethereum involve a sender and a recipient, which can be either u
 
 These practices and mechanisms are foundational for anyone looking to engage with cryptocurrencies while prioritizing privacy and security.
 
+## Value-Centric Web3 Red Teaming
+
+- Inventory value-bearing components (signers, oracles, bridges, automation) to understand who can move funds and how.
+- Map each component to relevant MITRE AADAPT tactics to expose privilege escalation paths.
+- Rehearse flash-loan/oracle/credential/cross-chain attack chains to validate impact and document exploitable preconditions.
+
+{{#ref}}
+value-centric-web3-red-teaming.md
+{{#endref}}
+
+## Web3 Signing Workflow Compromise
+
+- Supply-chain tampering of wallet UIs can mutate EIP-712 payloads right before signing, harvesting valid signatures for delegatecall-based proxy takeovers (e.g., slot-0 overwrite of Safe masterCopy).
+
+{{#ref}}
+web3-signing-workflow-compromise-safe-delegatecall-proxy-takeover.md
+{{#endref}}
+
+## Account Abstraction (ERC-4337)
+
+- Common smart-account failure modes include bypassing `EntryPoint` access control, unsigned gas fields, stateful validation, ERC-1271 replay, and fee-drain via revert-after-validation.
+
+{{#ref}}
+erc-4337-smart-account-security-pitfalls.md
+{{#endref}}
+
+## Smart Contract Security
+
+- Mutation testing to find blind spots in test suites:
+
+{{#ref}}
+../smart-contract-security/mutation-testing-with-slither.md
+{{#endref}}
+
+## ZK Proof / zkVM Guest Integrity
+
+When a prover uses a **zkVM** or an application-specific proof circuit to attest a claim, the verifier is only learning that the **guest program executed as written**. If the guest contains **unsafe deserialization**, **undefined behavior**, or **missing semantic constraints**, a malicious prover may generate a proof that verifies while the **public metrics or claimed invariant are false**.
+
+### Unsafe deserialization inside proof guests
+
+- Treat private witness/circuit bytes as **untrusted attacker input** even if they are hidden by the proof.
+- Avoid deserializing them with unchecked helpers such as `rkyv::access_unchecked` unless the bytes were already validated out-of-band.
+- Enum discriminants, relative pointers, lengths, and indexes loaded from untrusted serialized data must be validated before they influence control flow or memory access.
+
+Practical audit pattern:
+
+```rust
+let private_circuit_bytes = sp1_zkvm::io::read_vec();
+let ops = unsafe {
+    rkyv::access_unchecked::<rkyv::Archived<Vec<Op>>>(&private_circuit_bytes)
+};
+```
+
+If a field such as `op.kind` is an enum and an attacker can inject an **out-of-range discriminant**, every downstream `match` on that value becomes suspicious.
+
+### Jump-table / UB counter bypass
+
+If Rust lowers a large `match` into a **jump table**, an invalid enum discriminant may produce **undefined control flow**. A dangerous pattern is:
+
+1. One `match` updates **security-critical counters/constraints**.
+2. A second `match` performs the **real instruction semantics**.
+3. An out-of-range discriminant indexes past the first jump table and lands in code associated with the second one.
+
+Result: the operation still executes, but the accounting path is skipped. In a zkVM this can forge proofs that report impossible metrics such as fewer gates, fewer expensive operations, or other falsified bounded resources.
+
+Review checklist:
+
+- Look for attacker-controlled enums deserialized from witness/private input.
+- Inspect repeated `match` statements over the same opcode/kind field.
+- Treat `unsafe` + unchecked deserialization + large opcode dispatch as a high-risk combination.
+- Reverse engineer the emitted binary when needed; jump-table layout can matter more than the source.
+
+### Missing semantic constraints in reversible/specialized interpreters
+
+Do not just validate memory safety; also validate the **semantic rules** that the proof is meant to enforce.
+
+For reversible/quantum-like instruction sets, ensure operands that must be distinct are actually constrained to be distinct. A Toffoli/CCX-like operation implemented as:
+
+```rust
+let v = cond & self.qubit(op.q_control1) & self.qubit(op.q_control2);
+*self.qubit_mut(op.q_target) ^= v;
+```
+
+becomes unsafe if the guest does not reject:
+
+```text
+op.q_control1 == op.q_control2 == op.q_target
+```
+
+In that case the transition collapses into:
+
+```text
+q = q ^ (q & q) = 0
+```
+
+This creates a **deterministic reset primitive**, breaking reversibility assumptions and enabling cheaper non-intended computations. In proof systems that attest resource usage, this can let attackers satisfy functional checks while bypassing the cost model the verifier believes is being enforced.
+
+### What to test in ZK systems
+
+- Fuzz all guest parsers with malformed witness/private-input encodings.
+- Assert enum range validation before opcode dispatch.
+- Add semantic checks for operand aliasing and other invalid instruction forms.
+- Compare reported/public counters against an independent reference implementation.
+- Remember that a valid proof can still prove the **wrong statement** if the guest program is buggy.
+
+## DeFi/AMM Exploitation
+
+If you are researching practical exploitation of DEXes and AMMs (Uniswap v4 hooks, rounding/precision abuse, flash‑loan amplified threshold‑crossing swaps), check:
+
+{{#ref}}
+defi-amm-hook-precision.md
+{{#endref}}
+
+For multi-asset weighted pools that cache virtual balances and can be poisoned when `supply == 0`, study:
+
+{{#ref}}
+defi-amm-virtual-balance-cache-exploitation.md
+{{#endref}}
+
 ## References
 
 - [https://en.wikipedia.org/wiki/Proof_of_stake](https://en.wikipedia.org/wiki/Proof_of_stake)
@@ -184,8 +303,8 @@ These practices and mechanisms are foundational for anyone looking to engage wit
 - [https://ethereum.org/en/developers/docs/transactions/](https://ethereum.org/en/developers/docs/transactions/)
 - [https://ethereum.org/en/developers/docs/gas/](https://ethereum.org/en/developers/docs/gas/)
 - [https://en.bitcoin.it/wiki/Privacy](https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse)
+- [Trail of Bits - We beat Google's zero-knowledge proof of quantum cryptanalysis](https://blog.trailofbits.com/2026/04/17/we-beat-googles-zero-knowledge-proof-of-quantum-cryptanalysis/)
+- [Google patched paper version](https://arxiv.org/abs/2603.28846v2)
+- [Trail of Bits proof-of-concept repository](https://github.com/trailofbits/quantum-zk-proof-poc)
 
 {{#include ../../banners/hacktricks-training.md}}
-
-
-

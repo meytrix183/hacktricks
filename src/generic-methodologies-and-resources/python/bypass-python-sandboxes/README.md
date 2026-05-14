@@ -4,6 +4,11 @@
 
 These are some tricks to bypass python sandbox protections and execute arbitrary commands.
 
+{{#ref}}
+js2py-sandbox-escape-cve-2024-28397.md
+{{#endref}}
+
+
 ## Command Execution Libraries
 
 The first thing you need to know is if you can directly execute code with some already imported library, or if you could import any of these libraries:

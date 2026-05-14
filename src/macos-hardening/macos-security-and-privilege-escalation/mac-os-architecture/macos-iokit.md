@@ -101,11 +101,14 @@ In IORegistryExplorer, "planes" are used to organize and display the relationshi
 
 ## Driver Comm Code Example
 
-The following code connects to the IOKit service `"YourServiceNameHere"` and calls the function inside the selector 0. For it:
+The following code connects to the IOKit service `YourServiceNameHere` and calls selector 0:
 
-- it first calls **`IOServiceMatching`** and **`IOServiceGetMatchingServices`** to get the service.
-- It then establish a connection calling **`IOServiceOpen`**.
+- It first calls **`IOServiceMatching`** and **`IOServiceGetMatchingServices`** to get the service.
+- It then establishes a connection calling **`IOServiceOpen`**.
 - And it finally calls a function with **`IOConnectCallScalarMethod`** indicating the selector 0 (the selector is the number the function you want to call has assigned).
+
+<details>
+<summary>Example user-space call to a driver selector</summary>
 
 ```objectivec
 #import <Foundation/Foundation.h>
@@ -161,6 +164,8 @@ int main(int argc, const char * argv[]) {
     return 0;
 }
 ```
+
+</details>
 
 There are **other** functions that can be used to call IOKit functions apart of **`IOConnectCallScalarMethod`** like **`IOConnectCallMethod`**, **`IOConnectCallStructMethod`**...
 
@@ -229,7 +234,138 @@ After the array is created you can see all the exported functions:
 > [!TIP]
 > If you remember, to **call** an **exported** function from user space we don't need to call the name of the function, but the **selector number**. Here you can see that the selector **0** is the function **`initializeDecoder`**, the selector **1** is **`startDecoder`**, the selector **2** **`initializeEncoder`**...
 
+## Recent IOKit attack surface (2023–2025)
+
+- **Keystroke capture via IOHIDFamily** – CVE-2024-27799 (14.5) showed a permissive `IOHIDSystem` client could grab HID events even with secure input; ensure `externalMethod` handlers enforce entitlements instead of only the user-client type.
+- **IOGPUFamily memory corruption** – CVE-2024-44197 and CVE-2025-24257 fixed OOB writes reachable from sandboxed apps that pass malformed variable-length data to GPU user clients; the usual bug is poor bounds around `IOConnectCallStructMethod` arguments.
+- **Legacy keystroke monitoring** – CVE-2023-42891 (14.2) confirmed HID user clients remain a sandbox-escape vector; fuzz any driver exposing keyboard/event queues.
+
+### Quick triage & fuzzing tips
+
+- Enumerate all external methods for a user client from userland to seed a fuzzer:
+
+```bash
+# list selectors for a service
+python3 - <<'PY'
+from ioreg import IORegistry
+svc = 'IOHIDSystem'
+reg = IORegistry()
+obj = reg.get_service(svc)
+for sel, name in obj.external_methods():
+    print(f"{sel:02d} {name}")
+PY
+```
+
+- When reversing, pay attention to `IOExternalMethodDispatch2022` counts. A common bug pattern in recent CVEs is inconsistent `structureInputSize`/`structureOutputSize` vs. actual `copyin` length, leading to heap OOB in `IOConnectCallStructMethod`.
+- Sandbox reachability still hinges on entitlements. Before spending time on a target, check if the client is allowed from a third‑party app:
+
+```bash
+strings /System/Library/Extensions/IOHIDFamily.kext/Contents/MacOS/IOHIDFamily | \
+  grep -E "^com\.apple\.(driver|private)"
+```
+
+- For GPU/iomfb bugs, passing oversized arrays through `IOConnectCallMethod` is often enough to trigger bad bounds. Minimal harness (selector X) to trigger size confusion:
+
+```c
+uint8_t buf[0x1000];
+size_t outSz = sizeof(buf);
+IOConnectCallStructMethod(conn, X, buf, sizeof(buf), buf, &outSz);
+```
+
+
+
+## DriverKit — User-Space Drivers
+
+### Basic Information
+
+**DriverKit** is Apple's user-space replacement for kernel extensions (kexts), introduced in macOS 10.15. DriverKit binaries (`.dext` bundles) run as user-space processes but communicate directly with the kernel through a privileged IOKit interface.
+
+DriverKit extensions manage hardware:
+- **USB** controllers and devices
+- **Thunderbolt** / PCIe devices
+- **HID** (keyboards, mice, game controllers)
+- **Audio** hardware
+- **Networking** interfaces
+- **Serial** and **Block Storage** devices
+
+Unlike kexts (which required SIP-disabled boot or notarization), DriverKit extensions are installed via `SystemExtensions.framework` and only require **one-time user approval**.
+
+### Discovery & Enumeration
+
+```bash
+# List all installed system extensions (includes DriverKit)
+systemextensionsctl list
+
+# Find all DriverKit extension bundles
+find / -name "*.dext" -type d 2>/dev/null
+
+# Check a binary's DriverKit entitlements
+codesign -d --entitlements - /path/to/binary.dext/binary 2>&1 | grep driverkit
+
+# Common DriverKit entitlements:
+# com.apple.developer.driverkit                    — Base DriverKit
+# com.apple.developer.driverkit.transport.usb      — USB device access
+# com.apple.developer.driverkit.transport.hid      — HID device access
+# com.apple.developer.driverkit.transport.pci      — PCIe device access
+# com.apple.developer.driverkit.transport.serial   — Serial port access
+# com.apple.developer.driverkit.family.networking  — Network interface
+# com.apple.developer.driverkit.family.audio       — Audio device
+```
+
+### Security Implications
+
+> [!WARNING]
+> DriverKit binaries have a **direct communication channel to the kernel**. Sending malformed messages through this channel can trigger kernel vulnerabilities. Each driver registers specific user-client classes, and malformed `IOConnectCallMethod` calls can cause kernel memory corruption.
+
+**Attack surface:**
+1. **Kernel IOKit message fuzzing** — Each DriverKit user-client exposes selectors callable from user space. Malformed arguments trigger kernel bugs.
+2. **USB device spoofing** — A compromised USB DriverKit binary can present a malicious USB device profile (e.g., emulate a keyboard for HID injection).
+3. **DMA attacks** — PCIe/Thunderbolt DriverKit extensions have potential DMA access to physical memory.
+4. **Persistence** — Once installed as a system extension, DriverKit binaries persist across reboots and app updates.
+
+### DriverKit IOKit User-Client Fuzzing
+
+```bash
+# Enumerate DriverKit user-client classes from entitlements
+codesign -d --entitlements - /path/to/binary.dext/binary 2>&1 \
+  | grep -A5 "com.apple.developer.driverkit.transport"
+
+# List IOService matching for DriverKit drivers
+ioreg -l | grep -i "UserClientClass" | sort -u
+
+# Check if the driver's user-client is reachable from a sandboxed app
+ioreg -c IOService -r -d 1 | grep -E '"IOClass"|"CFBundleIdentifier"' | head -40
+
+# Minimal fuzzing harness for a DriverKit selector:
+```
+
+```c
+#include <IOKit/IOKitLib.h>
+
+io_connect_t conn;
+// ... open connection to the DriverKit service ...
+
+// Fuzz selector X with oversized struct input
+uint8_t buf[0x2000];
+memset(buf, 'A', sizeof(buf));
+size_t outSz = sizeof(buf);
+kern_return_t kr = IOConnectCallStructMethod(conn, X, buf, sizeof(buf), buf, &outSz);
+// If the driver doesn't validate structureInputSize, this causes kernel OOB
+```
+
+### DriverKit CVEs
+
+| CVE | Description |
+|---|---|
+| CVE-2022-26766 | DriverKit USB stack vulnerability — kernel code execution |
+| CVE-2021-30838 | IOKit user-client type confusion in graphic drivers |
+| CVE-2024-44197 | IOGPUFamily OOB write via malformed DriverKit arguments |
+
+## References
+
+- [Apple Security Updates – macOS Sequoia 15.1 / Sonoma 14.7.1 (IOGPUFamily)](https://support.apple.com/en-us/121564)
+- [Rapid7 – IOHIDFamily CVE-2024-27799 summary](https://www.rapid7.com/db/vulnerabilities/apple-osx-iohidfamily-cve-2024-27799/)
+- [Apple Security Updates – macOS 13.6.1 (CVE-2023-42891 IOHIDFamily)](https://support.apple.com/en-us/121551)
+- [Apple Developer — DriverKit](https://developer.apple.com/documentation/driverkit)
+- [Apple Developer — System Extensions](https://developer.apple.com/documentation/systemextensions)
 {{#include ../../../banners/hacktricks-training.md}}
-
-
-

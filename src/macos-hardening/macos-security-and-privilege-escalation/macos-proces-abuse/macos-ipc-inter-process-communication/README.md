@@ -22,7 +22,7 @@ Port rights, which define what operations a task can perform, are key to this co
 
 - **Receive right**, which allows receiving messages sent to the port. Mach ports are MPSC (multiple-producer, single-consumer) queues, which means that there may only ever be **one receive right for each port** in the whole system (unlike with pipes, where multiple processes can all hold file descriptors to the read end of one pipe).
   - A **task with the Receive** right can receive messages and **create Send rights**, allowing it to send messages. Originally only the **own task has Receive right over its por**t.
-  - If the owner of the Receive right **dies** or kills it, the **send right became useless (dead name).**
+  - If the owner of the Receive right **dies** or kills it, the **send right becomes useless (dead name).**
 - **Send right**, which allows sending messages to the port.
   - The Send right can be **cloned** so a task owning a Send right can clone the right and **grant it to a third task**.
   - Note that **port rights** can also be **passed** though Mac messages.
@@ -1279,16 +1279,45 @@ For more info check:
 macos-mig-mach-interface-generator.md
 {{#endref}}
 
+## MIG handler type confusion -> fake vtable pointer-chain hijack
+
+If a MIG handler **retrieves a C++ object by Mach message-supplied ID** (e.g., from an internal Object Map) and then **assumes a specific concrete type without validating the real dynamic type**, later virtual calls can dispatch through attacker-controlled pointers. In `coreaudiod`’s `com.apple.audio.audiohald` service (CVE-2024-54529), `_XIOContext_Fetch_Workgroup_Port` used the looked-up `HALS_Object` as an `ioct` and executed a vtable call via:
+
+```asm
+mov rax, qword ptr [rdi]
+call qword ptr [rax + 0x168]  ; indirect call through vtable slot
+```
+
+Because `rax` comes from **multiple dereferences**, exploitation needs a structured pointer chain rather than a single overwrite. One working layout:
+
+1. In the **confused heap object** (treated as `ioct`), place a **pointer at +0x68** to attacker-controlled memory.
+2. At that controlled memory, place a **pointer at +0x0** to a **fake vtable**.
+3. In the fake vtable, write the **call target at +0x168**, so the handler jumps to attacker-chosen code when dereferencing `[rax+0x168]`.
+
+Conceptually:
+
+```
+HALS_Object + 0x68  -> controlled_object
+*(controlled_object + 0x0) -> fake_vtable
+*(fake_vtable + 0x168)     -> RIP target
+```
+
+### LLDB triage to anchor the gadget
+
+1. **Break on the faulting handler** (or `mach_msg`/`dispatch_mig_server`) and trigger the crash to confirm the dispatch chain (`HALB_MIGServer_server -> dispatch_mig_server -> _XIOContext_Fetch_Workgroup_Port`).
+2. In the crash frame, disassemble to capture the **indirect call slot offset** (`call qword ptr [rax + 0x168]`).
+3. Inspect registers/memory to verify where `rdi` (base object) and `rax` (vtable pointer) originate and whether the offsets above are reachable with controlled data.
+4. Use the offset map to heap-shape the **0x68 -> 0x0 -> 0x168** chain and convert the type confusion into a reliable control-flow hijack inside the Mach service.
+
 ## References
 
 - [https://docs.darlinghq.org/internals/macos-specifics/mach-ports.html](https://docs.darlinghq.org/internals/macos-specifics/mach-ports.html)
 - [https://knight.sc/malware/2019/03/15/code-injection-on-macos.html](https://knight.sc/malware/2019/03/15/code-injection-on-macos.html)
 - [https://gist.github.com/knightsc/45edfc4903a9d2fa9f5905f60b02ce5a](https://gist.github.com/knightsc/45edfc4903a9d2fa9f5905f60b02ce5a)
 - [https://sector7.computest.nl/post/2023-10-xpc-audit-token-spoofing/](https://sector7.computest.nl/post/2023-10-xpc-audit-token-spoofing/)
-- [https://sector7.computest.nl/post/2023-10-xpc-audit-token-spoofing/](https://sector7.computest.nl/post/2023-10-xpc-audit-token-spoofing/)
-- [\*OS Internals, Volume I, User Mode, Jonathan Levin](https://www.amazon.com/MacOS-iOS-Internals-User-Mode/dp/099105556X)
+- [*OS Internals, Volume I, User Mode, Jonathan Levin](https://www.amazon.com/MacOS-iOS-Internals-User-Mode/dp/099105556X)
 - [https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/task_get_special_port.html](https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/task_get_special_port.html)
-
+- [Project Zero – Sound Barrier 2](https://projectzero.google/2026/01/sound-barrier-2.html)
 {{#include ../../../../banners/hacktricks-training.md}}
 
 

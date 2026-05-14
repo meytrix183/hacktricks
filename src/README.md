@@ -49,18 +49,6 @@ You can check their **blog** in [**https://blog.stmcyber.com**](https://blog.stm
 
 ---
 
-### [RootedCON](https://www.rootedcon.com/)
-
-<figure><img src="images/image (45).png" alt=""><figcaption></figcaption></figure>
-
-[**RootedCON**](https://www.rootedcon.com) is the most relevant cybersecurity event in **Spain** and one of the most important in **Europe**. With **the mission of promoting technical knowledge**, this congress is a boiling meeting point for technology and cybersecurity professionals in every discipline.
-
-{{#ref}}
-https://www.rootedcon.com/
-{{#endref}}
-
----
-
 ### [Intigriti](https://www.intigriti.com)
 
 <figure><img src="images/image (47).png" alt=""><figcaption></figcaption></figure>
@@ -71,21 +59,6 @@ https://www.rootedcon.com/
 
 {{#ref}}
 https://go.intigriti.com/hacktricks
-{{#endref}}
-
----
-
-### [Trickest](https://trickest.com/?utm_campaign=hacktrics&utm_medium=banner&utm_source=hacktricks)
-
-<figure><img src="images/image (48).png" alt=""><figcaption></figcaption></figure>
-
-\
-Use [**Trickest**](https://trickest.com/?utm_campaign=hacktrics&utm_medium=banner&utm_source=hacktricks) to easily build and **automate workflows** powered by the world's **most advanced** community tools.
-
-Get Access Today:
-
-{{#ref}}
-https://trickest.com/?utm_campaign=hacktrics&utm_medium=banner&utm_source=hacktricks
 {{#endref}}
 
 ---
@@ -104,16 +77,26 @@ Join [**HackenProof Discord**](https://discord.com/invite/N3FrSbmwdy) server to 
 
 ---
 
-### [Pentest-Tools.com](https://pentest-tools.com/?utm_term=jul2024&utm_medium=link&utm_source=hacktricks&utm_campaign=spons) - The essential penetration testing toolkit
+### [Modern Security – AI & Application Security Training Platform](https://modernsecurity.io/)
 
-<figure><img src="images/pentest-tools.svg" alt=""><figcaption></figcaption></figure>
+<figure><img src="images/modern_security_logo.png" alt="Modern Security"><figcaption></figcaption></figure>
 
-**Get a hacker's perspective on your web apps, network, and cloud**
+Modern Security delivers **practical AI Security training** with an **engineering-first, hands-on lab approach**. Our courses are built for security engineers, AppSec professionals, and developers who want to **build, break, and secure real AI/LLM-powered applications**.
 
-**Find and report critical, exploitable vulnerabilities with real business impact.** Use our 20+ custom tools to map the attack surface, find security issues that let you escalate privileges, and use automated exploits to collect essential evidence, turning your hard work into persuasive reports.
+The **AI Security Certification** focuses on real-world skills, including:
+- Securing LLM and AI-powered applications  
+- Threat modeling for AI systems  
+- Embeddings, vector databases, and RAG security  
+- LLM attacks, abuse scenarios, and practical defenses  
+- Secure design patterns and deployment considerations  
+
+All courses are **on-demand**, **lab-driven**, and designed around **real-world security tradeoffs**, not just theory.
+
+👉 More details on the AI Security course:  
+https://www.modernsecurity.io/courses/ai-security-certification
 
 {{#ref}}
-https://pentest-tools.com/?utm_term=jul2024&utm_medium=link&utm_source=hacktricks&utm_campaign=spons
+https://modernsecurity.io/
 {{#endref}}
 
 ---
@@ -145,6 +128,20 @@ https://academy.8ksec.io/
 
 ---
 
+### [NaxusAI – AI Powered Security Scanner](https://academy.8ksec.io/)
+
+<figure><img src="images/logo-naxus.png" alt=""><figcaption></figcaption></figure>
+
+**NaxusAI** is an AI-powered security platform to find exploitable vulnerabilities before attackers do.
+
+**Code security tip**: sign up for NaxusAI, a smart vulnerability monitoring platform built for developers and security teams! Join us today and start using AI for **detecting, validating, and fixing real security risks before they reach production**!
+
+{{#ref}}
+https://naxusai.com
+{{#endref}}
+
+---
+
 ### [WebSec](https://websec.net/)
 
 <figure><img src="images/websec (1).svg" alt=""><figcaption></figcaption></figure>
@@ -159,21 +156,6 @@ In addition to the above WebSec is also a **committed supporter of HackTricks.**
 
 {{#ref}}
 https://www.youtube.com/watch?v=Zq2JycGDCPM
-{{#endref}}
-
----
-
-### [Venacus](https://venacus.com/?utm_medium=link&utm_source=hacktricks&utm_campaign=spons)
-
-<figure><img src="images/venacus-logo.svg" alt="venacus logo"><figcaption></figcaption></figure>
-
-[**Venacus**](https://venacus.com/?utm_medium=link&utm_source=hacktricks&utm_campaign=spons) is a data breach (leak) search engine. \
-We provide random string search (like google) over all types of data leaks big and small --not only the big ones-- over data from multiple sources. \
-People search, AI search, organization search, API (OpenAPI) access, theHarvester integration, all features a pentester needs.\
-**HackTricks continues to be a great learning platform for us all and we're proud to be sponsoring it!**
-
-{{#ref}}
-https://venacus.com/?utm_medium=link&utm_source=hacktricks&utm_campaign=spons
 {{#endref}}
 
 ---
@@ -224,6 +206,20 @@ https://www.lasttowersolutions.com/
 
 ---
 
+### [K8Studio - The Smarter GUI to Manage Kubernetes.](https://k8studio.io/)
+
+<figure><img src="images/k8studio.png" alt="k8studio logo"><figcaption></figcaption></figure>
+
+K8Studio IDE empowers DevOps, DevSecOps, and developers to manage, monitor, and secure Kubernetes clusters efficiently. Leverage our AI-driven insights, advanced security framework, and intuitive CloudMaps GUI to visualize your clusters, understand their state, and act with confidence.
+
+Moreover, K8Studio is **compatible with all major kubernetes distributions** (AWS, GCP, Azure, DO, Rancher, K3s, Openshift and more).
+
+{{#ref}}
+https://k8studio.io/
+{{#endref}}
+
+---
+
 ## License & Disclaimer
 
 Check them in:
@@ -237,4 +233,5 @@ welcome/hacktricks-values-and-faq.md
 ![HackTricks Github Stats](https://repobeats.axiom.co/api/embed/68f8746802bcf1c8462e889e6e9302d4384f164b.svg)
 
 {{#include ./banners/hacktricks-training.md}}
+
 

